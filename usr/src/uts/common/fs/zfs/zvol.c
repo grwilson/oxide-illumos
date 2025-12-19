@@ -124,6 +124,7 @@ typedef struct zvol_state {
 	dva_t		*zv_dvas;	/* block -> dva mapping for dump */
 	rangelock_t	zv_rangelock;
 	dnode_t		*zv_dn;		/* dnode hold */
+	kthread_t	*zv_alloc_thread;
 } zvol_state_t;
 
 /*
@@ -159,8 +160,8 @@ static int zvol_get_data(void *arg, lr_write_t *lr, char *buf,
 static int zvol_dumpify(zvol_state_t *zv);
 static int zvol_dump_fini(zvol_state_t *zv);
 static int zvol_dump_init(zvol_state_t *zv, boolean_t resize);
-static int zvol_raw_fini(objset_t *os);
-int zvol_prealloc(objset_t *os);
+static int zvol_raw_volume_fini(objset_t *os);
+int zvol_prealloc(zvol_state_t *zv, boolean_t wait);
 
 static void
 zvol_size_changed(zvol_state_t *zv, uint64_t volsize)
@@ -551,13 +552,29 @@ zvol_create_minor(const char *name)
 	zv->zv_volblocksize = doi.doi_data_block_size;
 
 	if (spa_writeable(dmu_objset_spa(os))) {
+		uint64_t rawvol;
+		error = zap_lookup(os, ZVOL_ZAP_OBJ,
+		    zfs_prop_to_name(ZFS_PROP_RAWVOL), 8, 1, &rawvol);
+		if (error == 0 && rawvol) {
+			zfs_dbgmsg("zvol_create_minor doing prealloc");
+			error = zvol_prealloc(zv, B_FALSE);
+		}
 		if (zil_replay_disable)
 			zil_destroy(dmu_objset_zil(os), B_FALSE);
 		else
 			zil_replay(os, zv, zvol_replay_vector);
 	}
-	dmu_objset_disown(os, 1, FTAG);
-	zv->zv_objset = NULL;
+
+	/*
+	 * If the zvol is EINPROGRESS, then we must keep the
+	 * objset open until the initialization completes.
+	 */
+	if (error == EINPROGRESS) {
+		error = 0;
+	} else {
+		dmu_objset_disown(os, 1, FTAG);
+		zv->zv_objset = NULL;
+	}
 
 	zvol_minors++;
 
@@ -620,6 +637,13 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	uint64_t readonly;
 	boolean_t ro;
 
+	/*
+	 * This indicates that the zvol is initializing.
+	 */
+	if (zv->zv_alloc_thread != NULL) {
+		return (EINPROGRESS);
+	}
+
 	ro = (rdonly || (strchr(zv->zv_name, '@') != NULL));
 	error = dmu_objset_own(zv->zv_name, DMU_OST_ZVOL, ro, B_TRUE, zv, &os);
 	if (error)
@@ -628,7 +652,6 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	zv->zv_objset = os;
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &volsize);
 	if (error) {
-		ASSERT(error == 0);
 		dmu_objset_disown(os, 1, zv);
 		return (error);
 	}
@@ -649,16 +672,11 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	error = zap_lookup(os, ZVOL_ZAP_OBJ, zfs_prop_to_name(ZFS_PROP_RAWVOL),
 	    8, 1, &rawvol);
 	if (error == 0 && rawvol) {
-
-		/* Allocate the space for the dump */
-		error = zvol_prealloc(os);
-		if (error == 0) {
-			error = zvol_get_dvas(zv);
-			if (error) {
-				zvol_free_dvas(zv);
-				dmu_objset_disown(os, 1, zv);
-				return (error);
-			}
+		error = zvol_get_dvas(zv);
+		if (error) {
+			zvol_free_dvas(zv);
+			dmu_objset_disown(os, 1, zv);
+			return (error);
 		}
 		zv->zv_flags |= ZVOL_RAW;
 	}
@@ -673,7 +691,7 @@ zvol_first_open(zvol_state_t *zv, boolean_t rdonly)
 	else
 		zv->zv_flags &= ~ZVOL_RDONLY;
 
-	return (error);
+	return (0);
 }
 
 void
@@ -702,12 +720,68 @@ zvol_last_close(zvol_state_t *zv)
 	zv->zv_objset = NULL;
 }
 
-int
-zvol_prealloc(objset_t *os)
+static uint64_t
+zvol_get_initialized_offset(objset_t *os)
 {
+	dmu_object_info_t doi;
+	VERIFY0(dmu_object_info(os, ZVOL_OBJ, &doi));
+	if (doi.doi_fill_count == 0) {
+		return (0);
+	} else {
+		return (doi.doi_max_offset);
+	}
+}
+
+static void
+zvol_allocate(void *arg)
+{
+	zvol_state_t *zv = arg;
+	objset_t *os = zv->zv_objset;
 	dmu_tx_t *tx;
+	uint64_t off;
+	uint64_t resid;
+
+	VERIFY0(zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &resid));
+
+	off = zvol_get_initialized_offset(os);
+	zfs_dbgmsg("initialzing from offset %llu to %llu", off, resid);
+
+	resid -= off;
+	while (resid != 0) {
+		uint64_t bytes = MIN(resid, SPA_OLD_MAXBLOCKSIZE);
+
+		tx = dmu_tx_create(os);
+		dmu_tx_hold_write(tx, ZVOL_OBJ, off, bytes);
+		int error = dmu_tx_assign(tx, TXG_WAIT);
+		if (error) {
+			dmu_tx_abort(tx);
+			(void) dmu_free_long_range(os, ZVOL_OBJ,
+			    0, off);
+			zfs_dbgmsg("zvol_allocate failed: %d", error);
+			goto out;
+			return;
+		}
+		dmu_zero(os, ZVOL_OBJ, off, bytes, tx);
+
+		off += bytes;
+		resid -= bytes;
+		dmu_tx_commit(tx);
+	}
+	txg_wait_synced(dmu_objset_pool(os), 0);
+
+out:
+	if (zv->zv_alloc_thread != NULL) {
+		zv->zv_alloc_thread = NULL;
+		dmu_objset_disown(os, 1, zv);
+	}
+}
+
+int
+zvol_prealloc(zvol_state_t *zv, boolean_t wait)
+{
+	objset_t *os = zv->zv_objset;
 	uint64_t refd, avail, usedobjs, availobjs;
-	uint64_t off = 0;
+	uint64_t off;
 	uint64_t volsize;
 	uint64_t resid;
 
@@ -716,11 +790,7 @@ zvol_prealloc(objset_t *os)
 		return (SET_ERROR(EINVAL));
 	}
 
-	error = zap_lookup(os, ZVOL_ZAP_OBJ, "zeroed", 8, 1, &off);
-	if (error) {
-		off = 0;
-	}
-
+	off = zvol_get_initialized_offset(os);
 	if (resid == off) {
 		zfs_dbgmsg("already allocated");
 		return (0);
@@ -728,36 +798,22 @@ zvol_prealloc(objset_t *os)
 
 	/* Check the space usage before attempting to allocate the space */
 	dmu_objset_space(os, &refd, &avail, &usedobjs, &availobjs);
-	if (avail < resid)
+	if (avail < (resid - off)) {
+		zfs_dbgmsg("zvol_prealloc ENOSPC avail %llu, resid %llu, "
+		    "offset %llu", avail, resid, off);
 		return (SET_ERROR(ENOSPC));
-
-/*
-	XXX --- do this elsewhere or not at all
-	zvol_free_dvas(zv);
-*/
-
-	while (resid != 0) {
-		uint64_t bytes = MIN(resid, SPA_OLD_MAXBLOCKSIZE);
-
-		tx = dmu_tx_create(os);
-		dmu_tx_hold_write(tx, ZVOL_OBJ, off, bytes);
-		dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
-		error = dmu_tx_assign(tx, TXG_WAIT);
-		if (error) {
-			dmu_tx_abort(tx);
-			(void) dmu_free_long_range(os, ZVOL_OBJ, 0, off);
-			return (error);
-		}
-		dmu_zero(os, ZVOL_OBJ, off, bytes, tx);
-		off += bytes;
-		resid -= bytes;
-		VERIFY0(zap_update(os, ZVOL_ZAP_OBJ, "zeroed", 8, 1,
-	            &off, tx));
-		dmu_tx_commit(tx);
 	}
-	txg_wait_synced(dmu_objset_pool(os), 0);
 
-	return (0);
+	if (wait) {
+		zvol_allocate(zv);
+		return (0);
+	}
+
+	if (zv->zv_alloc_thread == NULL) {
+		zv->zv_alloc_thread = thread_create(NULL, 0,
+		    zvol_allocate, zv, 0, &p0, TS_RUN, maxclsyspri);
+	}
+	return (EINPROGRESS);
 }
 
 static int
@@ -1246,23 +1302,23 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 	int error = 0;
 
 	smt_begin_unsafe();
-        while (resid != 0 && off < volsize) {
-                size_t size = MIN(resid, zvol_maxphys);
-                size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
+	while (resid != 0 && off < volsize) {
+		size_t size = MIN(resid, zvol_maxphys);
+		size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
 
-                error = zvol_rawio(zv, bp, off, size);
-                if (error)
-                        break;
-                off += size;
-                resid -= size;
-        }
+		error = zvol_rawio(zv, bp, off, size);
+		if (error)
+			break;
+		off += size;
+		resid -= size;
+	}
 
-        if ((bp->b_resid = resid) == bp->b_bcount)
-                bioerror(bp, off > volsize ? EINVAL : error);
+	if ((bp->b_resid = resid) == bp->b_bcount)
+		bioerror(bp, off > volsize ? EINVAL : error);
 
-        biodone(bp);
-        smt_end_unsafe();
-        return (0);
+	biodone(bp);
+	smt_end_unsafe();
+	return (0);
 }
 
 int
@@ -2004,18 +2060,16 @@ zfs_mvdev_dump_activate_feature_sync(void *arg, dmu_tx_t *tx)
 }
 
 int
-zvol_raw_init(objset_t *os, boolean_t resize)
+zvol_raw_volume_create(objset_t *os, boolean_t resize)
 {
 	dmu_tx_t *tx;
 	int error;
 	spa_t *spa = dmu_objset_spa(os);
-	vdev_t *vd = spa->spa_root_vdev;
 	nvlist_t *nv = NULL;
 	uint64_t version = spa_version(spa);
 	uint64_t checksum, compress, refresrv, vbs, dedup;
 
 	ASSERT(MUTEX_HELD(&zfsdev_state_lock));
-	ASSERT(vd->vdev_ops == &vdev_root_ops);
 
 	error = dmu_free_long_range(os, ZVOL_OBJ, 0,
 	    DMU_OBJECT_END);
@@ -2023,26 +2077,6 @@ zvol_raw_init(objset_t *os, boolean_t resize)
 		return (error);
 	/* wait for dmu_free_long_range to actually free the blocks */
 	txg_wait_synced(dmu_objset_pool(os), 0);
-
-	/*
-	 * If the pool on which the dump device is being initialized has more
-	 * than one child vdev, check that the MULTI_VDEV_CRASH_DUMP feature is
-	 * enabled.  If so, bump that feature's counter to indicate that the
-	 * feature is active. We also check the vdev type to handle the
-	 * following case:
-	 *   # zpool create test raidz disk1 disk2 disk3
-	 *   Now have spa_root_vdev->vdev_children == 1 (the raidz vdev),
-	 *   the raidz vdev itself has 3 children.
-	 */
-	if (vd->vdev_children > 1 || vd->vdev_ops == &vdev_raidz_ops) {
-		if (!spa_feature_is_enabled(spa,
-		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP))
-			return (SET_ERROR(ENOTSUP));
-		(void) dsl_sync_task(spa_name(spa),
-		    zfs_mvdev_dump_feature_check,
-		    zfs_mvdev_dump_activate_feature_sync, NULL,
-		    2, ZFS_SPACE_CHECK_RESERVED);
-	}
 
 	if (!resize) {
 		error = dsl_prop_get_int_ds(dmu_objset_ds(os),
@@ -2078,7 +2112,7 @@ zvol_raw_init(objset_t *os, boolean_t resize)
 	}
 
 	/*
-	 * If we are resizing the dump device then we only need to
+	 * If we are resizing the device then we only need to
 	 * update the refreservation to match the newly updated
 	 * zvolsize. Otherwise, we save off the original state of the
 	 * zvol so that we can restore them if the zvol is ever undumpified.
@@ -2123,8 +2157,8 @@ zvol_raw_init(objset_t *os, boolean_t resize)
 	dmu_tx_commit(tx);
 
 	/*
-	 * We only need update the zvol's property if we are initializing
-	 * the dump area for the first time.
+	 * We only need to update the zvol's property if we are initializing
+	 * for the first time.
 	 */
 	if (error == 0 && !resize) {
 		/*
@@ -2162,10 +2196,35 @@ zvol_raw_init(objset_t *os, boolean_t resize)
 static int
 zvol_dump_init(zvol_state_t *zv, boolean_t resize)
 {
-	int error = zvol_raw_init(zv->zv_objset, resize);
+	spa_t *spa = dmu_objset_spa(zv->zv_objset);
+	vdev_t *vd = spa->spa_root_vdev;
+
+	ASSERT(vd->vdev_ops == &vdev_root_ops);
+
+	/*
+	 * If the pool on which the dump device is being initialized has more
+	 * than one child vdev, check that the MULTI_VDEV_CRASH_DUMP feature is
+	 * enabled.  If so, bump that feature's counter to indicate that the
+	 * feature is active. We also check the vdev type to handle the
+	 * following case:
+	 *   # zpool create test raidz disk1 disk2 disk3
+	 *   Now have spa_root_vdev->vdev_children == 1 (the raidz vdev),
+	 *   the raidz vdev itself has 3 children.
+	 */
+	if (vd->vdev_children > 1 || vd->vdev_ops == &vdev_raidz_ops) {
+		if (!spa_feature_is_enabled(spa,
+		    SPA_FEATURE_MULTI_VDEV_CRASH_DUMP))
+			return (SET_ERROR(ENOTSUP));
+		(void) dsl_sync_task(spa_name(spa),
+		    zfs_mvdev_dump_feature_check,
+		    zfs_mvdev_dump_activate_feature_sync, NULL,
+		    2, ZFS_SPACE_CHECK_RESERVED);
+	}
+
+	int error = zvol_raw_volume_create(zv->zv_objset, resize);
 	if (error == 0) {
 		zv->zv_volblocksize = SPA_OLD_MAXBLOCKSIZE;
-		error = zvol_prealloc(zv->zv_objset);
+		error = zvol_prealloc(zv, B_TRUE);
 	}
 	return (error);
 }
@@ -2227,7 +2286,7 @@ zvol_dumpify(zvol_state_t *zv)
 }
 
 static int
-zvol_raw_fini(objset_t *os) 
+zvol_raw_volume_fini(objset_t *os)
 {
 	dmu_tx_t *tx;
 	nvlist_t *nv;
@@ -2239,18 +2298,8 @@ zvol_raw_fini(objset_t *os)
 	 * Attempt to restore the zvol back to a standard zvol.
 	 * This is a best-effort attempt as it's possible that not all
 	 * of these properties were initialized during the conversion process
-	 * (i.e. error during zvol_raw_init).
+	 * (i.e. error during zvol_raw_volume_create).
 	 */
-
-	tx = dmu_tx_create(os);
-	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
-	error = dmu_tx_assign(tx, TXG_WAIT);
-	if (error) {
-		dmu_tx_abort(tx);
-		return (error);
-	}
-	(void) zap_remove(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, tx);
-	dmu_tx_commit(tx);
 
 	(void) zap_lookup(os, ZVOL_ZAP_OBJ,
 	    zfs_prop_to_name(ZFS_PROP_CHECKSUM), 8, 1, &checksum);
@@ -2309,7 +2358,17 @@ zvol_dump_fini(zvol_state_t *zv)
 	 * (i.e. error during zvol_dump_init).
 	 */
 
-	error = zvol_raw_fini(zv->zv_objset);
+	dmu_tx_t *tx = dmu_tx_create(zv->zv_objset);
+	dmu_tx_hold_zap(tx, ZVOL_ZAP_OBJ, TRUE, NULL);
+	error = dmu_tx_assign(tx, TXG_WAIT);
+	if (error) {
+		dmu_tx_abort(tx);
+		return (error);
+	}
+	(void) zap_remove(zv->zv_objset, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, tx);
+	dmu_tx_commit(tx);
+
+	error = zvol_raw_volume_fini(zv->zv_objset);
 	if (error == 0) {
 		uint64_t vbs;
 		zvol_free_dvas(zv);

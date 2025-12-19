@@ -3396,10 +3396,9 @@ zfs_ioc_create(const char *fsname, nvlist_t *innvl, nvlist_t *outnvl)
 		    FTAG, &os);
 		if (error != 0)
 			return (SET_ERROR(EPERM));
-                zfs_dbgmsg("Calling zvol_raw_init");
-                error = zvol_raw_init(os, B_FALSE);
+		error = zvol_raw_volume_create(os, B_FALSE);
 		dmu_objset_disown(os, B_FALSE, FTAG);
-        }
+	}
 
 	nvlist_free(zct.zct_zplprops);
 	dsl_crypto_params_free(dcp, !!error);
