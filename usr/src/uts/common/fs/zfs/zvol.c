@@ -288,6 +288,7 @@ zvol_free_dvas(zvol_state_t *zv)
 {
 	if (zv->zv_dvas != NULL) {
 		kmem_free(zv->zv_dvas, zvol_num_blocks(zv) * sizeof (dva_t));
+		zv->zv_dvas = NULL;
 	}
 }
 
