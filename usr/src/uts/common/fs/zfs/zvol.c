@@ -1311,7 +1311,7 @@ zvol_raw_strategy(zvol_state_t *zv, buf_t *bp)
 		size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
 
 		bioclone(bp, bp_offset, size, 0, 0, NULL, &child_bp, KM_SLEEP);
-		error = zvol_rawio(zv, bp, off, size);
+		error = zvol_rawio(zv, &child_bp, off, size);
 		if (error)
 			break;
 
