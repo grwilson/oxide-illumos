@@ -783,7 +783,7 @@ zvol_zero(zvol_state_t *zv)
 	VERIFY0(zap_lookup(os, ZVOL_ZAP_OBJ, "size", 8, 1, &resid));
 
 	off = zvol_get_initialized_offset(os);
-	zfs_dbgmsg("zv %p initialzing from offset %llu to %llu",
+	zfs_dbgmsg("zv %p initializing from offset %llu to %llu",
 	    zv, off, resid);
 
 	mutex_enter(&zv->zv_state_lock);
