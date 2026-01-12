@@ -113,12 +113,12 @@ static uint32_t zvol_minors;
  */
 enum zio_flags {
 	ZVOL_RDONLY		= 1 << 0,
-	ZVOL_DUMPIFIED		= 1 << 1,
-	ZVOL_EXCL		= 1 << 2,
-	ZVOL_WCE		= 1 << 3,
+	ZVOL_EXCL		= 1 << 1,
+	ZVOL_WCE		= 1 << 2,
+	ZVOL_DUMPIFIED		= 1 << 3,
 	ZVOL_RAW		= 1 << 4,
-	ZVOL_RAW_INITIALIZED	= 1 << 5,
-	ZVOL_RAW_READY		= 1 << 6
+	/* Used by both dump or raw zvols to indicate preallocation finished */
+	ZVOL_PREALLOCED		= 1 << 5
 };
 
 /*
@@ -314,7 +314,6 @@ static void
 zvol_free_dvas(zvol_state_t *zv)
 {
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
-	zv->zv_flags &= ~ZVOL_RAW_READY;
 	if (zv->zv_dvas != NULL) {
 		/*
 		 * Note, ndvas may differ from zvol_num_blocks() if the volume
@@ -333,7 +332,7 @@ zvol_get_dvas(zvol_state_t *zv)
 	int		err;
 
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
-	VERIFY(zv->zv_flags & ZVOL_RAW_INITIALIZED);
+	VERIFY(zv->zv_flags & ZVOL_PREALLOCED);
 	zvol_free_dvas(zv);
 
 	/* commit any in-flight changes before traversing the dataset */
@@ -356,7 +355,6 @@ zvol_get_dvas(zvol_state_t *zv)
 		zvol_free_dvas(zv);
 		return (err);
 	}
-	zv->zv_flags |= ZVOL_RAW_READY;
 
 	return (0);
 }
@@ -802,7 +800,8 @@ zvol_zero(zvol_state_t *zv)
 			mutex_enter(&zv->zv_state_lock);
 			break;
 		}
-		dmu_zero(os, ZVOL_OBJ, off, bytes, tx);
+		dmu_zero(os, ZVOL_OBJ, off, bytes,
+		    (zv->zv_flags & ZVOL_DUMPIFIED), tx);
 
 		bytes_zeroed += bytes;
 		off += bytes;
@@ -828,7 +827,7 @@ zvol_zero(zvol_state_t *zv)
 
 	if (error == 0) {
 		VERIFY0(resid);
-		zv->zv_flags |= ZVOL_RAW_INITIALIZED;
+		zv->zv_flags |= ZVOL_PREALLOCED;
 	}
 
 	mutex_exit(&zv->zv_state_lock);
@@ -889,10 +888,10 @@ zvol_prealloc(zvol_state_t *zv)
 	if (zv->zv_zero_thread == NULL) {
 		/*
 		 * We are getting ready to initialize the raw volume so
-		 * disable the ZVOL_RAW_INITIALIZED flag to prevent any
-		 * I/Os from progressing.
+		 * set the ZVOL_PREALLOCED flag to prevent any I/Os from
+		 * progressing.
 		 */
-		zv->zv_flags &= ~ZVOL_RAW_INITIALIZED;
+		zv->zv_flags &= ~ZVOL_PREALLOCED;
 
 		/*
 		 * We are about to start the initialization of the raw volume
@@ -1334,6 +1333,8 @@ zvol_dumpio(zvol_state_t *zv, caddr_t addr, uint64_t vol_offset, uint64_t size,
 {
 	spa_t *spa = dmu_objset_spa(zv->zv_objset);
 
+	ASSERT(zv->zv_flags & ZVOL_PREALLOCED);
+
 	/* Must be sector aligned, and not straddle a block boundary. */
 	if (P2PHASE(vol_offset, DEV_BSIZE) || P2PHASE(size, DEV_BSIZE) ||
 	    P2BOUNDARY(vol_offset, size, zv->zv_volblocksize)) {
@@ -1381,22 +1382,36 @@ zvol_rawio(zvol_state_t *zv, buf_t *bp, uint64_t vol_offset, uint64_t size)
 	int error;
 
 	/*
-	 * This indicates that the zvol is initializing.
-	 * I/O to raw volumes requires the ZVOL_RAW_READY
-	 * flag to be set. The zvol requires two phases
-	 * to be considered ready -- first it must initialize
-	 * the space and then build the dva map. The first
-	 * phase is considered complete when the zvol sets the
-	 * ZVOL_RAW_INITIALIZED. This phase can take a while
-	 * to complete so we return an error immediately to all
-	 * the user to retry. Once the zvol is initialized, the dva
-	 * map creations happens quickly so it's okay to block.
+	 * Opening a raw volume for the first time triggers several
+	 * initialization tasks: preallocating blocks, zeroing them, and
+	 * building the DVA mapping. This process occurs asynchronously,
+	 * allowing the 'open' call to succeed while initialization continues
+	 * in the background. The most time-consuming phase--marked by the
+	 * ZVOL_PREALLOCED flag-—involves allocating and zeroing blocks via
+	 * writes or trims. While preallocation is a one-time operation for
+	 * the lifetime of the zvol, the DVA mapping must be rebuilt as part
+	 * every initial open.
+	 *
+	 * If a consumer opens a raw volume and attempts I/O before
+	 * initialization is complete, the system must manage the request
+	 * based on the current phase of initialization. If the ZVOL_PREALLOCED
+	 * flag is not yet set, the system returns EINPROGRESS. However, if
+	 * I/O is attempted after preallocation completes but before the DVA
+	 * mapping phase finishes, the application will block.
+	 *
+	 * We choose to block rather than return an error to prevent a race
+	 * condition where the mapping is destroyed. If the system returned an
+	 * error, the application might close its file descriptor, triggering
+	 * the destruction of the DVA mapping. This would create a cycle: the
+	 * application opens the volume, triggers an asynchronous DVA map
+	 * build, receives an error on I/O, and closes the descriptor-—
+	 * effectively canceling the mapping process before it can finish.
 	 */
-	if (!(zv->zv_flags & ZVOL_RAW_INITIALIZED)) {
+	if (!(zv->zv_flags & ZVOL_PREALLOCED)) {
 		return (SET_ERROR(EINPROGRESS));
 	} else {
 		mutex_enter(&zv->zv_state_lock);
-		while (!(zv->zv_flags & ZVOL_RAW_READY)) {
+		while (zv->zv_dvas == NULL) {
 			if (!cv_wait_sig(&zv->zv_state_cv,
 			    &zv->zv_state_lock)) {
 				mutex_exit(&zv->zv_state_lock);
@@ -1550,6 +1565,8 @@ zvol_strategy(buf_t *bp)
 	while (resid != 0 && off < volsize) {
 		size_t size = MIN(resid, zvol_maxphys);
 		if (is_dumpified) {
+			ASSERT3P(zv->zv_dvas, !=, NULL);
+			ASSERT3(zv->zv_flags & ZVOL_PREALLOCED);
 			size = MIN(size, P2END(off, zv->zv_volblocksize) - off);
 			error = zvol_dumpio(zv, addr, off, size,
 			    doread, B_FALSE);
@@ -2514,6 +2531,7 @@ zvol_dumpify(zvol_state_t *zv)
 		}
 		zv->zv_volblocksize = SPA_OLD_MAXBLOCKSIZE;
 	}
+	zv->zv_flags |= ZVOL_DUMPIFIED;
 
 	mutex_enter(&zv->zv_state_lock);
 	error = zvol_prealloc(zv);
@@ -2538,7 +2556,6 @@ zvol_dumpify(zvol_state_t *zv)
 		return (error);
 	}
 
-	zv->zv_flags |= ZVOL_DUMPIFIED;
 	error = zap_update(os, ZVOL_ZAP_OBJ, ZVOL_DUMPSIZE, 8, 1,
 	    &zv->zv_volsize, tx);
 	dmu_tx_commit(tx);
