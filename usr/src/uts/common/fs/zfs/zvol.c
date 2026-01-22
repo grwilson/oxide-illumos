@@ -2166,7 +2166,7 @@ out:
 		}
 		mutex_exit(&zv->zv_state_lock);
 		mutex_exit(&zfsdev_state_lock);
-		return (zv->zv_zero_error);
+		return (0);
 	}
 
 	case DKIOCINFO:
