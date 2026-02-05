@@ -1069,11 +1069,12 @@ zvol_update_volsize(objset_t *os, uint64_t volsize)
 	    &volsize, tx);
 	dmu_tx_commit(tx);
 
-	txg_wait_synced(dmu_objset_pool(os), txg);
-
 	if (error == 0)
 		error = dmu_free_long_range(os,
 		    ZVOL_OBJ, volsize, DMU_OBJECT_END);
+	txg_wait_synced(dmu_objset_pool(os), 0);
+
+	zfs_dbgmsg("size changed %llu", zvol_get_initialized_offset(os));
 	return (error);
 }
 
