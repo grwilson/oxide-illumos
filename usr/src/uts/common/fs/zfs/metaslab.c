@@ -24,6 +24,7 @@
  * Copyright (c) 2013 by Saso Kiselkov. All rights reserved.
  * Copyright (c) 2014 Integros [integros.com]
  * Copyright (c) 2017, Intel Corporation.
+ * Copyright 2026 Oxide Computer Company
  */
 
 #include <sys/zfs_context.h>
@@ -679,6 +680,63 @@ metaslab_compare(const void *x1, const void *x2)
 	IMPLY(TREE_CMP(m1->ms_start, m2->ms_start) == 0, m1 == m2);
 
 	return (TREE_CMP(m1->ms_start, m2->ms_start));
+}
+
+/*
+ * Return the largest histogram index (log2(blocksize)) that can be used
+ * to fully allocate space_needed based on the metaslab class histogram.
+ *
+ * The histogram index represents log2(blocksize), and each entry contains
+ * the count of free ranges of that size.
+ *
+ * blksize_hint semantics:
+ *   - blksize_hint == UINT64_MAX: no upper bound is applied
+ *   - otherwise: blksize_hint is a size in bytes and acts as an upper bound
+ *
+ * The upper bound of the returned index is SPA_MAXBLOCKSHIFT and the
+ * lower bound is the vdev's physical blocksize (i.e. spa_max_ashift).
+ */
+int
+metaslab_class_find_blockshift(metaslab_class_t *mc, uint64_t space_needed,
+    uint64_t blksize_hint)
+{
+	uint64_t avail_space = 0;
+	int idx;
+	int min_idx = mc->mc_spa->spa_max_ashift;
+
+	if (blksize_hint != UINT64_MAX) {
+		VERIFY3U(blksize_hint, >=, SPA_MINBLOCKSIZE);
+		VERIFY(ISP2(blksize_hint));
+
+		idx = MAX(MIN(RANGE_TREE_HISTOGRAM_SIZE - 1,
+		    highbit64(blksize_hint) - 1), min_idx);
+	} else {
+		idx = RANGE_TREE_HISTOGRAM_SIZE - 1;
+	}
+
+	/*
+	 * Walk from larger to smaller block sizes, accumulating
+	 * available space until space_needed can be satisfied.
+	 * If we're already at the lower bound, then there's no point
+	 * validating that space_needed can be fully allocated.
+	 */
+	for (; idx > min_idx; idx--) {
+		avail_space += mc->mc_histogram[idx] * (1ULL << idx);
+
+		if (avail_space >= space_needed)
+			break;
+	}
+
+	/*
+	 * Ensure the result never exceed the maximum block size supported
+	 * by the SPA.
+	 */
+	idx = MIN(idx, SPA_MAXBLOCKSHIFT);
+
+	VERIFY3U(idx, >=, min_idx);
+	VERIFY3U(idx, <, RANGE_TREE_HISTOGRAM_SIZE);
+
+	return (idx);
 }
 
 /*
