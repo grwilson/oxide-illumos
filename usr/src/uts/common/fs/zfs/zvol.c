@@ -1102,6 +1102,21 @@ zvol_remove_minors(const char *name)
 }
 
 static int
+zvol_raw_volume_resize(zvol_state_t *zv)
+{
+	mutex_enter(&zv->zv_state_lock);
+	int error = zvol_prealloc(zv);
+	if (error == 0) {
+		while (zv->zv_zero_thread != NULL) {
+			cv_wait(&zv->zv_state_cv, &zv->zv_state_lock);
+		}
+		error = zv->zv_zero_error;
+	}
+	mutex_exit(&zv->zv_state_lock);
+	return (error);
+}
+
+static int
 zvol_update_live_volsize(zvol_state_t *zv, uint64_t volsize)
 {
 	uint64_t old_volsize = 0ULL;
@@ -1128,6 +1143,14 @@ zvol_update_live_volsize(zvol_state_t *zv, uint64_t volsize)
 			zvol_size_changed(zv, old_volsize);
 			dumpify_error = zvol_dumpify(zv);
 			error = dumpify_error ? dumpify_error : error;
+		}
+	} else if (zv->zv_flags & ZVOL_RAW) {
+		error = zvol_raw_volume_resize(zv);
+		if (error != 0) {
+			(void) zvol_update_volsize(zv->zv_objset, old_volsize);
+			zvol_size_changed(zv, old_volsize);
+			int resize_error = zvol_raw_volume_resize(zv);
+			error = resize_error ? resize_error: error;
 		}
 	}
 
@@ -1182,13 +1205,7 @@ zvol_set_volsize(const char *name, uint64_t volsize)
 	if (error = zvol_check_volsize(volsize, zv->zv_volblocksize) != 0)
 		goto out;
 
-	if (zv->zv_flags & ZVOL_RAW) {
-		error = SET_ERROR(ERANGE);
-		goto out;
-	}
-
 	error = zvol_update_volsize(zv->zv_objset, volsize);
-
 	if (error == 0)
 		error = zvol_update_live_volsize(zv, volsize);
 out:
