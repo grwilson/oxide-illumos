@@ -478,6 +478,7 @@ metaslab_class_histogram_verify(metaslab_class_t *mc)
 	vdev_t *rvd = spa->spa_root_vdev;
 	uint64_t *mc_hist;
 	int i;
+	uint64_t free_space = 0;
 
 	if ((zfs_flags & ZFS_DEBUG_HISTOGRAM_VERIFY) == 0)
 		return;
@@ -498,12 +499,17 @@ metaslab_class_histogram_verify(metaslab_class_t *mc)
 			continue;
 		}
 
-		for (i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++)
+		for (i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++) {
 			mc_hist[i] += mg->mg_histogram[i];
+			free_space += mc_hist[i] * (1ULL << i);
+		}
 	}
 
 	for (i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++)
 		VERIFY3U(mc_hist[i], ==, mc->mc_histogram[i]);
+
+	zfs_dbgmsg("mc %p histogram free space %llu, mc_space %llu",
+	    mc, free_space, mc->mc_space - mc->mc_alloc);
 
 	kmem_free(mc_hist, sizeof (uint64_t) * RANGE_TREE_HISTOGRAM_SIZE);
 }
@@ -1058,9 +1064,14 @@ metaslab_group_histogram_verify(metaslab_group_t *mg)
 	for (int m = 0; m < vd->vdev_ms_count; m++) {
 		metaslab_t *msp = vd->vdev_ms[m];
 
-		/* skip if not active or not a member */
-		if (msp->ms_sm == NULL || msp->ms_group != mg)
+		/* skip if not a member */
+		if (msp->ms_group != mg)
 			continue;
+
+		if (msp->ms_sm == NULL) {
+			mg_hist[vd->vdev_ms_shift]++;
+			continue;
+		}
 
 		for (i = 0; i < SPACE_MAP_HISTOGRAM_SIZE; i++)
 			mg_hist[i + ashift] +=
@@ -1080,8 +1091,12 @@ metaslab_group_histogram_add(metaslab_group_t *mg, metaslab_t *msp)
 	uint64_t ashift = mg->mg_vd->vdev_ashift;
 
 	ASSERT(MUTEX_HELD(&msp->ms_lock));
-	if (msp->ms_sm == NULL)
+	if (msp->ms_sm == NULL) {
+		uint64_t ms_shift = mg->mg_vd->vdev_ms_shift;
+		mg->mg_histogram[ms_shift]++;
+		mc->mc_histogram[ms_shift]++;
 		return;
+	}
 
 	mutex_enter(&mg->mg_lock);
 	for (int i = 0; i < SPACE_MAP_HISTOGRAM_SIZE; i++) {
@@ -1100,8 +1115,12 @@ metaslab_group_histogram_remove(metaslab_group_t *mg, metaslab_t *msp)
 	uint64_t ashift = mg->mg_vd->vdev_ashift;
 
 	ASSERT(MUTEX_HELD(&msp->ms_lock));
-	if (msp->ms_sm == NULL)
+	if (msp->ms_sm == NULL) {
+		uint64_t ms_shift = mg->mg_vd->vdev_ms_shift;
+		mg->mg_histogram[ms_shift]++;
+		mc->mc_histogram[ms_shift]++;
 		return;
+	}
 
 	mutex_enter(&mg->mg_lock);
 	for (int i = 0; i < SPACE_MAP_HISTOGRAM_SIZE; i++) {
