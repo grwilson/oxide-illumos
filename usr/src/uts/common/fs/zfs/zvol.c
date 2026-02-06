@@ -820,6 +820,8 @@ zvol_get_initialized_offset(objset_t *os)
 	}
 }
 
+int zfs_volsize_pct = 80;
+
 static uint64_t
 zvol_raw_max_blocksize(zvol_state_t *zv)
 {
@@ -840,8 +842,9 @@ zvol_raw_max_blocksize(zvol_state_t *zv)
 		    "blocksize %llu", zv, zv->zv_volblocksize, blksize_hint);
 	}
 
+	uint64_t space_needed = zv->zv_volsize * zfs_volsize_pct / 100;
 	int blkshift = metaslab_class_find_blockshift(spa_normal_class(spa),
-	    zv->zv_volsize, blksize_hint);
+	    space_needed, blksize_hint);
 
 	uint64_t blksz = 1ULL << blkshift;
 
@@ -883,7 +886,7 @@ zvol_zero(zvol_state_t *zv)
 		 * Set the blocksize the first time we're initializing
 		 * the volume.
 		 */
-		if (zv->zv_zero_off == 0) {
+		if (zv->zv_zero_off == 0 && !(zv->zv_flags & ZVOL_DUMPIFIED)) {
 			uint64_t blocksize = zvol_raw_max_blocksize(zv);
 
 			error = dmu_object_set_blocksize(
@@ -964,7 +967,7 @@ zvol_zero_thread(void *arg)
 		    zv, zv->zv_flags, zv->zv_total_opens, error);
 		zv->zv_zero_error = error;
 
-	} while (error == EFRAGS);
+	} while (error == EFRAGS && !(zv->zv_flags & ZVOL_DUMPIFIED));
 
 	zv->zv_zero_exit_wanted = B_FALSE;
 	zv->zv_zero_thread = NULL;
