@@ -314,6 +314,7 @@ static void metaslab_flush_update(metaslab_t *, dmu_tx_t *);
 static unsigned int metaslab_idx_func(multilist_t *, void *);
 static void metaslab_evict(metaslab_t *, uint64_t);
 static void metaslab_rt_add(range_tree_t *rt, range_seg_t *rs, void *arg);
+static void metaslab_group_preload(metaslab_group_t *mg, boolean_t limit);
 
 kmem_cache_t *metaslab_alloc_trace_cache;
 
@@ -688,6 +689,19 @@ metaslab_compare(const void *x1, const void *x2)
 	return (TREE_CMP(m1->ms_start, m2->ms_start));
 }
 
+static void
+metaslab_group_loaded_histogram(metaslab_group_t *mg, uint64_t *histogram)
+{
+	avl_tree_t *t = &mg->mg_metaslab_tree;
+	metaslab_t *msp;
+
+	for (msp = avl_first(t); msp != NULL; msp = AVL_NEXT(t, msp)) {
+		for (int i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++) {
+			histogram[i] += msp->ms_allocatable->rt_histogram[i];
+		}
+	}
+}
+
 /*
  * Return the largest histogram index (log2(blocksize)) that can be used
  * to fully allocate space_needed based on the metaslab class histogram.
@@ -706,9 +720,11 @@ int
 metaslab_class_find_blockshift(metaslab_class_t *mc, uint64_t space_needed,
     uint64_t blksize_hint)
 {
+	spa_t *spa = mc->mc_spa;
 	uint64_t avail_space = 0;
 	int idx;
-	int min_idx = mc->mc_spa->spa_max_ashift;
+	int min_idx = spa->spa_max_ashift;
+	uint64_t histogram[RANGE_TREE_HISTOGRAM_SIZE];
 
 	if (blksize_hint != UINT64_MAX) {
 		VERIFY3U(blksize_hint, >=, SPA_MINBLOCKSIZE);
@@ -720,6 +736,18 @@ metaslab_class_find_blockshift(metaslab_class_t *mc, uint64_t space_needed,
 		idx = RANGE_TREE_HISTOGRAM_SIZE - 1;
 	}
 
+	spa_config_enter(spa, SCL_CONFIG, spa, RW_READER);
+	boolean_t save_debug_unload = metaslab_debug_unload;
+	metaslab_debug_unload = B_TRUE;
+	metaslab_group_t *mg = mc->mc_rotor;
+	do {
+		metaslab_group_preload(mg, B_FALSE);
+		taskq_wait(mg->mg_taskq);
+		metaslab_group_loaded_histogram(mg, histogram);
+	} while ((mg = mg->mg_next) != mc->mc_rotor);
+	metaslab_debug_unload = save_debug_unload;
+	spa_config_exit(spa, SCL_CONFIG, spa);
+
 	/*
 	 * Walk from larger to smaller block sizes, accumulating
 	 * available space until space_needed can be satisfied.
@@ -727,7 +755,10 @@ metaslab_class_find_blockshift(metaslab_class_t *mc, uint64_t space_needed,
 	 * validating that space_needed can be fully allocated.
 	 */
 	for (; idx > min_idx; idx--) {
+#if 0
 		avail_space += mc->mc_histogram[idx] * (1ULL << idx);
+#endif
+		avail_space += histogram[idx] * (1ULL << idx);
 
 		if (avail_space >= space_needed)
 			break;
@@ -3460,7 +3491,7 @@ metaslab_preload(void *arg)
 }
 
 static void
-metaslab_group_preload(metaslab_group_t *mg)
+metaslab_group_preload(metaslab_group_t *mg, boolean_t limit)
 {
 	spa_t *spa = mg->mg_vd->vdev_spa;
 	metaslab_t *msp;
@@ -3486,7 +3517,8 @@ metaslab_group_preload(metaslab_group_t *mg)
 		 * to condense then we preload it too. This will ensure
 		 * that force condensing happens in the next txg.
 		 */
-		if (++m > metaslab_preload_limit && !msp->ms_condense_wanted) {
+		if (limit && ++m > metaslab_preload_limit &&
+		    !msp->ms_condense_wanted) {
 			continue;
 		}
 
@@ -4412,7 +4444,7 @@ metaslab_sync_reassess(metaslab_group_t *mg)
 	 * for preloading.
 	 */
 	if (mg->mg_activation_count > 0) {
-		metaslab_group_preload(mg);
+		metaslab_group_preload(mg, B_TRUE);
 	}
 	spa_config_exit(spa, SCL_ALLOC, FTAG);
 }
