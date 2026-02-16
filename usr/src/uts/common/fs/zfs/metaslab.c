@@ -726,7 +726,7 @@ metaslab_class_find_blockshift(metaslab_class_t *mc, uint64_t space_needed,
 	uint64_t avail_space = 0;
 	int idx;
 	int min_idx = spa->spa_max_ashift;
-	uint64_t histogram[RANGE_TREE_HISTOGRAM_SIZE];
+	uint64_t histogram[RANGE_TREE_HISTOGRAM_SIZE] = {0};
 
 	if (blksize_hint != UINT64_MAX) {
 		VERIFY3U(blksize_hint, >=, SPA_MINBLOCKSIZE);
