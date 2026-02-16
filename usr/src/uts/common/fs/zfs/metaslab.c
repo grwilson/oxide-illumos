@@ -758,6 +758,9 @@ metaslab_class_find_blockshift(metaslab_class_t *mc, uint64_t space_needed,
 		avail_space += mc->mc_histogram[idx] * (1ULL << idx);
 #endif
 		avail_space += histogram[idx] * (1ULL << idx);
+		zfs_dbgmsg("mc %p, needed %llu, avail_space %llu, "
+		    "histogram %llu, idx %d", mc, space_needed, avail_space,
+		    histogram[idx], idx);
 
 		if (avail_space >= space_needed)
 			break;
