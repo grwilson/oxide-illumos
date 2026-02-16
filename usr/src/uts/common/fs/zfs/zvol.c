@@ -820,8 +820,6 @@ zvol_get_initialized_offset(objset_t *os)
 	}
 }
 
-int zfs_volsize_pct = 80;
-
 static uint64_t
 zvol_raw_max_blocksize(zvol_state_t *zv)
 {
@@ -842,9 +840,8 @@ zvol_raw_max_blocksize(zvol_state_t *zv)
 		    "blocksize %llu", zv, zv->zv_volblocksize, blksize_hint);
 	}
 
-	uint64_t space_needed = zv->zv_volsize * zfs_volsize_pct / 100;
 	int blkshift = metaslab_class_find_blockshift(spa_normal_class(spa),
-	    space_needed, blksize_hint);
+	    zv->zv_volsize, blksize_hint);
 
 	uint64_t blksz = 1ULL << blkshift;
 
