@@ -2510,6 +2510,7 @@ metaslab_load_impl(metaslab_t *msp)
 int
 metaslab_load(metaslab_t *msp)
 {
+	range_tree_t *allocatable = msp->ms_allocatable;
 	ASSERT(MUTEX_HELD(&msp->ms_lock));
 
 	/*
@@ -2518,8 +2519,8 @@ metaslab_load(metaslab_t *msp)
 	 */
 	metaslab_load_wait(msp);
 	if (msp->ms_loaded) {
-		bcopy(msp->ms_allocatable->rt_histogram,
-		    msp->ms_last_loaded_hist, RANGE_TREE_HISTOGRAM_SIZE);
+		bcopy(allocatable->rt_histogram, msp->ms_last_loaded_hist,
+		    sizeof (allocatable->rt_histogram));
 		return (0);
 	}
 	VERIFY(!msp->ms_loading);
@@ -2560,8 +2561,8 @@ metaslab_load(metaslab_t *msp)
 
 	int error = metaslab_load_impl(msp);
 
-	bcopy(msp->ms_allocatable->rt_histogram, msp->ms_last_loaded_hist,
-	    RANGE_TREE_HISTOGRAM_SIZE);
+	bcopy(allocatable->rt_histogram, msp->ms_last_loaded_hist,
+	    sizeof (allocatable->rt_histogram));
 
 	ASSERT(MUTEX_HELD(&msp->ms_lock));
 	msp->ms_loading = B_FALSE;
@@ -3542,6 +3543,11 @@ metaslab_group_preload(metaslab_group_t *mg, uint64_t *histogram)
 		for (msp = avl_first(t); msp != NULL; msp = AVL_NEXT(t, msp)) {
 			for (int i = 0; i < RANGE_TREE_HISTOGRAM_SIZE; i++) {
 				histogram[i] += msp->ms_last_loaded_hist[i];
+				if (msp->ms_last_loaded_hist[i] != 0) {
+					zfs_dbgmsg("msp %p, hist %llu, idx %d",
+					    msp, msp->ms_last_loaded_hist[i],
+					    i);
+				}
 			}
 		}
 		mutex_exit(&mg->mg_lock);
