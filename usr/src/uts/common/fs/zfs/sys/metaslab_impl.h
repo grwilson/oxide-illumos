@@ -541,7 +541,6 @@ struct metaslab {
 	uint64_t	ms_synced_length;
 
 	boolean_t	ms_new;
-	uint64_t	ms_last_loaded_hist[RANGE_TREE_HISTOGRAM_SIZE];
 };
 
 typedef struct metaslab_unflushed_phys {
