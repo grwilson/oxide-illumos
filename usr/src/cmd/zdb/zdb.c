@@ -1786,7 +1786,8 @@ dump_bptree(objset_t *os, uint64_t obj, const char *name)
 
 	(void) printf("\n");
 
-	(void) bptree_iterate(os, obj, B_FALSE, dump_bptree_cb, NULL, NULL);
+	(void) bptree_iterate(os, obj, B_FALSE, dump_bptree_cb, NULL, NULL,
+	    NULL, NULL);
 }
 
 /* ARGSUSED */

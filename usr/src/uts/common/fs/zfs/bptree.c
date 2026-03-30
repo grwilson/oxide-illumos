@@ -117,6 +117,21 @@ bptree_is_empty(objset_t *os, uint64_t obj)
 	return (rv);
 }
 
+uint64_t
+bptree_last_entry(objset *os, uint64_t obj)
+{
+	bptree_phys_t *bt;
+
+	if (!spa_feature_is_active(dmu_objset_spa(os),
+	    SPA_FEATURE_ASYNC_DESTROY))
+		return (-1ULL);
+
+	VERIFY3U(0, ==, dmu_bonus_hold(os, obj, FTAG, &db));
+	bt = db->db_data;
+	dmu_buf_rele(db, FTAG);
+	return (bt->bt_end);
+}
+
 void
 bptree_add(objset_t *os, uint64_t obj, blkptr_t *bp, uint64_t birth_txg,
     uint64_t bytes, uint64_t comp, uint64_t uncomp, dmu_tx_t *tx)
@@ -185,7 +200,7 @@ bptree_visit_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
  */
 int
 bptree_iterate(objset_t *os, uint64_t obj, boolean_t free, bptree_itor_t func,
-    void *arg, dmu_tx_t *tx)
+    bp_notification_t notify_func, void *arg, dmu_tx_t *tx)
 {
 	boolean_t ioerr = B_FALSE;
 	int err;
@@ -274,6 +289,8 @@ bptree_iterate(objset_t *os, uint64_t obj, boolean_t free, bptree_itor_t func,
 				ba.ba_phys->bt_begin++;
 				(void) dmu_free_range(os, obj,
 				    i * sizeof (bte), sizeof (bte), tx);
+				if (notify_func != NULL)
+					notify_func(arg, ba.ba_phys->bt_begin);
 			}
 		} else if (err != 0) {
 			break;

@@ -219,6 +219,11 @@ dsl_pool_open_impl(spa_t *spa, uint64_t txg)
 	mutex_init(&dp->dp_lock, NULL, MUTEX_DEFAULT, NULL);
 	cv_init(&dp->dp_spaceavail_cv, NULL, CV_DEFAULT, NULL);
 
+	mutex_init(&dp->dp_destroy_waiters_lock, NULL, MUTEX_DEFAULT, NULL);
+	list_create(&dp->dp_destroy_waiters_list,
+	    sizeof (dsl_pool_destroy_waiter_t),
+	    offsetof(dsl_pool_destroy_waiter_t, dpdw_list_node));
+
 	dp->dp_vnrele_taskq = taskq_create("zfs_vn_rele_taskq", 1, minclsyspri,
 	    1, 4, 0);
 	dp->dp_unlinked_drain_taskq = taskq_create("z_unlinked_drain",
@@ -402,6 +407,9 @@ dsl_pool_close(dsl_pool_t *dp)
 	txg_fini(dp);
 	dsl_scan_fini(dp);
 	dmu_buf_user_evict_wait();
+
+	mutex_destroy(&dp->dp_destroy_waiters_lock);
+	list_destroy(&dp->dp_destroy_waiters_list);
 
 	rrw_destroy(&dp->dp_config_rwlock);
 	mutex_destroy(&dp->dp_lock);
