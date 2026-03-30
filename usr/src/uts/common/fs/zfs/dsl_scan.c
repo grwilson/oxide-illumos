@@ -3090,26 +3090,21 @@ dsl_scan_free_block_cb(void *arg, const blkptr_t *bp, dmu_tx_t *tx)
 	return (0);
 }
 
-typedef dsl_pool_destory_waiter {
-	uint64_t dpdw_slot;
-	kcondvar_t *dpdw_cv;
-	list_node_t *dpdw_list_node;
-} dsl_pool_destroy_waiter_t;
-
 void
 dsl_scan_async_destroy_notify(void *arg, uint64_t slot)
 {
 	dsl_scan_t *scn = arg;
 	dsl_pool_t *dp = scn->scn_dp;
-	list_t *dp->dp_destroy_waiters_list;
-	dsl_pool_destroy_waiter_t dpdw;
+	list_t *l = &dp->dp_destroy_waiters_list;
+	dsl_pool_destroy_waiter_t *dpdw;
 
 	mutex_enter(&dp->dp_destroy_waiters_lock);
-	for (dpdw = list_head(l); dpdw != NULL; dwdw = list_next(l, dwdw)) {
-		if (dpdw.dpdw_slot < slot) {
+	for (dpdw = list_head(l); dpdw != NULL; dpdw = list_next(l, dpdw)) {
+		if (dpdw->dpdw_slot < slot) {
 			list_remove(l, dpdw);
-			if (dpdw.dpdw_cv != NULL)
-				cv_signal(dpdw.dpdw_cv);
+			if (dpdw->dpdw_cv != NULL)
+				cv_signal(dpdw->dpdw_cv);
+			kmem_free(dpdw, sizeof (*dpdw));
 		}
 	}
 	mutex_exit(&dp->dp_destroy_waiters_lock);
@@ -3118,22 +3113,20 @@ dsl_scan_async_destroy_notify(void *arg, uint64_t slot)
 int
 dsl_scan_async_destory_add_waiter(dsl_pool_t *dp, kcondvar_t *cv)
 {
-	dsl_pool_waiter_t dpdw;
+	dsl_pool_destroy_waiter_t *dpdw;
 
 	if (!spa_feature_is_active(dp->dp_spa, SPA_FEATURE_ASYNC_DESTROY))
-		return (-1ULL);
+		return (ENOTSUP);
 
-	VERIFY3U(0, ==, dmu_bonus_hold(dp->dp_meta_objset, dp->dp_bptree_obj,
-	    FTAG, &db));
-
-	dpdw.dpdw_slot = bptree_last_entry(dp->dp_meta_objset,
+	dpdw = kmem_zalloc(sizeof (dsl_pool_destroy_waiter_t), KM_SLEEP);
+	dpdw->dpdw_slot = bptree_last_entry(dp->dp_meta_objset,
 	    dp->dp_bptree_obj);
-	dpdw.dpdw_cv = cv;
+	dpdw->dpdw_cv = cv;
 	mutex_enter(&dp->dp_destroy_waiters_lock);
-	list_insert(dp->dp_destroy_waiters_list, dpdw);
+	list_insert_tail(&dp->dp_destroy_waiters_list, dpdw);
 	mutex_exit(&dp->dp_destroy_waiters_lock);
+	return (0);
 }
-
 
 static void
 dsl_scan_update_stats(dsl_scan_t *scn)

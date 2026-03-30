@@ -131,8 +131,8 @@ typedef struct dsl_pool {
 	taskq_t *dp_sync_taskq;
 	taskq_t *dp_zil_clean_taskq;
 
-	list_t *dp_destroy_waiters_list;
-	kmutex_t *dp_destroy_waiters_lock;
+	list_t dp_destroy_waiters_list;
+	kmutex_t dp_destroy_waiters_lock;
 
 	/*
 	 * Protects administrative changes (properties, namespace)

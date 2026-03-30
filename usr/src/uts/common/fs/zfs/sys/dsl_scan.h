@@ -67,6 +67,12 @@ typedef struct dsl_scan_phys {
 	uint64_t scn_flags; /* dsl_scan_flags_t */
 } dsl_scan_phys_t;
 
+typedef struct dsl_pool_destory_waiter {
+	uint64_t dpdw_slot;
+	kcondvar_t *dpdw_cv;
+	list_node_t dpdw_list_node;
+} dsl_pool_destroy_waiter_t;
+
 #define	SCAN_PHYS_NUMINTS (sizeof (dsl_scan_phys_t) / sizeof (uint64_t))
 
 typedef enum dsl_scan_flags {

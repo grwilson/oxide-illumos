@@ -36,6 +36,7 @@
 #include <sys/dnode.h>
 #include <sys/refcount.h>
 #include <sys/spa.h>
+#include <sys/zfeature.h>
 
 /*
  * A bptree is a queue of root block pointers from destroyed datasets. When a
@@ -118,9 +119,10 @@ bptree_is_empty(objset_t *os, uint64_t obj)
 }
 
 uint64_t
-bptree_last_entry(objset *os, uint64_t obj)
+bptree_last_entry(objset_t *os, uint64_t obj)
 {
 	bptree_phys_t *bt;
+	dmu_buf_t *db;
 
 	if (!spa_feature_is_active(dmu_objset_spa(os),
 	    SPA_FEATURE_ASYNC_DESTROY))
@@ -200,7 +202,7 @@ bptree_visit_cb(spa_t *spa, zilog_t *zilog, const blkptr_t *bp,
  */
 int
 bptree_iterate(objset_t *os, uint64_t obj, boolean_t free, bptree_itor_t func,
-    bp_notification_t notify_func, void *arg, dmu_tx_t *tx)
+    bptree_notification_t notify_func, void *arg, dmu_tx_t *tx)
 {
 	boolean_t ioerr = B_FALSE;
 	int err;

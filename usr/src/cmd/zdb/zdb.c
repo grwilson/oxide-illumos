@@ -1787,7 +1787,7 @@ dump_bptree(objset_t *os, uint64_t obj, const char *name)
 	(void) printf("\n");
 
 	(void) bptree_iterate(os, obj, B_FALSE, dump_bptree_cb, NULL, NULL,
-	    NULL, NULL);
+	    NULL);
 }
 
 /* ARGSUSED */
@@ -4565,7 +4565,7 @@ dump_block_stats(spa_t *spa)
 	if (spa_feature_is_active(spa, SPA_FEATURE_ASYNC_DESTROY)) {
 		VERIFY3U(0, ==, bptree_iterate(spa->spa_meta_objset,
 		    spa->spa_dsl_pool->dp_bptree_obj, B_FALSE, count_block_cb,
-		    &zcb, NULL));
+		    NULL, &zcb, NULL));
 	}
 
 	if (dump_opt['c'] > 1)
