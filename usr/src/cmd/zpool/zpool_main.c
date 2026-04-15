@@ -8609,7 +8609,7 @@ print_wait_status_row(wait_data_t *wd, zpool_handle_t *zhp, int row)
 	pool_scan_stat_t *pss = NULL;
 	pool_removal_stat_t *prs = NULL;
 	char *headers[] = {"DISCARD", "FREE", "INITIALIZE", "REPLACE",
-	    "REMOVE", "RESILVER", "SCRUB", "TRIM"};
+	    "REMOVE", "RESILVER", "SCRUB", "TRIM", "DESTROY"};
 	int col_widths[ZPOOL_WAIT_NUM_ACTIVITIES];
 
 	/* Calculate the width of each column */
@@ -8803,7 +8803,7 @@ zpool_do_wait(int argc, char **argv)
 		{
 			static char *col_subopts[] = { "discard", "free",
 			    "initialize", "replace", "remove", "resilver",
-			    "scrub", "trim", NULL };
+			    "scrub", "trim", "destroy', NULL };
 
 			/* Reset activities array */
 			bzero(&wd.wd_enabled, sizeof (wd.wd_enabled));

@@ -9064,7 +9064,7 @@ spa_vdev_activity_in_progress(spa_t *spa, boolean_t use_guid, uint64_t guid,
 
 static int
 spa_activity_in_progress(spa_t *spa, zpool_wait_activity_t activity,
-    boolean_t use_tag, uint64_t tag, boolean_t *in_progress)
+    boolean_t use_tag, uint64_t tag, uint64_t *private, boolean_t *in_progress)
 {
 	int error = 0;
 
@@ -9113,6 +9113,18 @@ spa_activity_in_progress(spa_t *spa, zpool_wait_activity_t activity,
 		    is_scrub == (activity == ZPOOL_WAIT_SCRUB));
 		break;
 	}
+	case ZPOOL_WAIT_DESTROY:
+	{
+		dsl_pool_t *dp = spa->spa_dsl_pool;
+		uint64_t last_slot = bptree_last_entry(dp->dp_meta_objset,
+		    dp->dp_bptree_obj);
+		if (*private == UINT64_MAX)
+			*private = last_slot;
+		*in_progress =
+		    (spa_feature_is_active(spa, SPA_FEATURE_ASYNC_DESTROY) &&
+		    *private >= last_slot;
+		break;
+	}
 	default:
 		panic("unrecognized value for activity %d", activity);
 	}
@@ -9159,10 +9171,11 @@ spa_wait_common(const char *pool, zpool_wait_activity_t activity,
 	spa_close(spa, FTAG);
 
 	*waited = B_FALSE;
+	uint64_t private = UINT64_MAX;
 	for (;;) {
 		boolean_t in_progress;
 		error = spa_activity_in_progress(spa, activity, use_tag, tag,
-		    &in_progress);
+		    &private, &in_progress);
 
 		if (error || !in_progress || spa->spa_waiters_cancel)
 			break;

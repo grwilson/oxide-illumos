@@ -69,7 +69,6 @@ typedef struct dsl_scan_phys {
 
 typedef struct dsl_pool_destory_waiter {
 	uint64_t dpdw_slot;
-	kcondvar_t *dpdw_cv;
 	list_node_t dpdw_list_node;
 } dsl_pool_destroy_waiter_t;
 
