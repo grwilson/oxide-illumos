@@ -293,6 +293,7 @@ bptree_iterate(objset_t *os, uint64_t obj, boolean_t free, bptree_itor_t func,
 				    i * sizeof (bte), sizeof (bte), tx);
 				if (notify_func != NULL)
 					notify_func(arg, ba.ba_phys->bt_begin);
+				spa_notify_waiters(os->os_spa);
 			}
 		} else if (err != 0) {
 			break;

@@ -3105,30 +3105,10 @@ dsl_scan_async_destroy_notify(void *arg, uint64_t slot)
 	for (dpdw = list_head(l); dpdw != NULL; dpdw = list_next(l, dpdw)) {
 		if (dpdw->dpdw_slot < slot) {
 			list_remove(l, dpdw);
-			if (dpdw->dpdw_cv != NULL)
-				cv_signal(dpdw->dpdw_cv);
 			kmem_free(dpdw, sizeof (*dpdw));
 		}
 	}
 	mutex_exit(&dp->dp_destroy_waiters_lock);
-}
-
-int
-dsl_scan_async_destory_add_waiter(dsl_pool_t *dp, kcondvar_t *cv)
-{
-	dsl_pool_destroy_waiter_t *dpdw;
-
-	if (!spa_feature_is_active(dp->dp_spa, SPA_FEATURE_ASYNC_DESTROY))
-		return (ENOTSUP);
-
-	dpdw = kmem_zalloc(sizeof (dsl_pool_destroy_waiter_t), KM_SLEEP);
-	dpdw->dpdw_slot = bptree_last_entry(dp->dp_meta_objset,
-	    dp->dp_bptree_obj);
-	dpdw->dpdw_cv = cv;
-	mutex_enter(&dp->dp_destroy_waiters_lock);
-	list_insert_tail(&dp->dp_destroy_waiters_list, dpdw);
-	mutex_exit(&dp->dp_destroy_waiters_lock);
-	return (0);
 }
 
 static void

@@ -9122,7 +9122,7 @@ spa_activity_in_progress(spa_t *spa, zpool_wait_activity_t activity,
 			*private = last_slot;
 		*in_progress =
 		    (spa_feature_is_active(spa, SPA_FEATURE_ASYNC_DESTROY) &&
-		    *private >= last_slot;
+		    *private >= last_slot);
 		break;
 	}
 	default:

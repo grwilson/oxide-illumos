@@ -8803,7 +8803,7 @@ zpool_do_wait(int argc, char **argv)
 		{
 			static char *col_subopts[] = { "discard", "free",
 			    "initialize", "replace", "remove", "resilver",
-			    "scrub", "trim", "destroy', NULL };
+			    "scrub", "trim", "destroy", NULL };
 
 			/* Reset activities array */
 			bzero(&wd.wd_enabled, sizeof (wd.wd_enabled));
