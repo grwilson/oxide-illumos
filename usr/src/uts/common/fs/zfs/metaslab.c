@@ -45,6 +45,7 @@
 
 uint64_t metaslab_aliquot = 512ULL << 10;
 uint64_t metaslab_force_ganging = SPA_MAXBLOCKSIZE + 1;	/* force gang blocks */
+uint64_t metaslab_force_max_blocksize = SPA_MAXBLOCKSIZE;
 
 /*
  * In pools where the log space map feature is not enabled we touch
@@ -732,7 +733,7 @@ metaslab_class_find_blocksize(metaslab_class_t *mc, uint64_t space_needed)
 	VERIFY3U(idx, >=, min_idx);
 	VERIFY3U(idx, <, RANGE_TREE_HISTOGRAM_SIZE);
 
-	return (1ULL << idx);
+	return (MIN(metaslab_force_max_blocksize, 1ULL << idx));
 }
 
 /*
