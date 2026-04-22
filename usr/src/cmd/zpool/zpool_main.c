@@ -8781,9 +8781,13 @@ zpool_do_wait(int argc, char **argv)
 	pthread_mutex_init(&wd.wd_mutex, NULL);
 	pthread_cond_init(&wd.wd_cv, NULL);
 
-	/* By default, wait for all types of activity. */
-	for (i = 0; i < ZPOOL_WAIT_NUM_ACTIVITIES; i++)
-		wd.wd_enabled[i] = B_TRUE;
+	/* By default, wait for all types of activity except destroy. */
+	for (i = 0; i < ZPOOL_WAIT_NUM_ACTIVITIES; i++) {
+		if (i == ZPOOL_WAIT_DESTROY)
+			wd.wd_enabled[i] = B_FALSE;
+		else
+			wd.wd_enabled[i] = B_TRUE;
+	}
 
 	while ((c = getopt(argc, argv, "HpT:t:")) != -1) {
 		switch (c) {
@@ -8851,6 +8855,20 @@ zpool_do_wait(int argc, char **argv)
 		usage(B_FALSE);
 	}
 
+	if (wd.wd_enabled[ZPOOL_WAIT_DESTROY]) {
+		for (i = 0; i < ZPOOL_WAIT_NUM_ACTIVITIES; i++) {
+			if (i == ZPOOL_WAIT_DESTROY)
+				continue;
+			if (wd.wd_enabled[i]) {
+				(void) fprintf(stderr, gettext(
+				    "waiting for 'destroy' operations "
+				    "cannot be combined with other wait "
+				    "activity\n"));
+				usage(B_FALSE);
+			}
+		}
+	}
+
 	wd.wd_poolname = argv[0];
 
 	if ((zhp = zpool_open(g_zfs, wd.wd_poolname)) == NULL)
@@ -8895,6 +8913,13 @@ zpool_do_wait(int argc, char **argv)
 
 			any_waited = (any_waited || waited);
 		}
+
+		/*
+		 * Don't wait for all destroys to finish, just the one we
+		 * are waiting on.
+		 */
+		if (wd.wd_enabled[ZPOOL_WAIT_DESTROY] && any_waited)
+			break;
 
 		if (error != 0 || missing || !any_waited)
 			break;
