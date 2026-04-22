@@ -1633,17 +1633,20 @@ zfs_do_destroy(int argc, char **argv)
 		 * Do the real thing.  The callback will close the
 		 * handle regardless of whether it succeeds or not.
 		 */
-		err = destroy_callback(zhp, &cb);
-		zhp = NULL;
+		if (!wait) {
+			err = destroy_callback(zhp, &cb);
+			zhp = NULL;
+		} else {
+			err = destroy_callback(zfs_handle_dup(zhp), &cb);
+                        rv = zpool_wait(zfs_get_pool_handle(zhp),
+			    ZPOOL_WAIT_DESTROY);
+		}
 		if (err == 0) {
 			err = zfs_destroy_snaps_nvl(g_zfs,
 			    cb.cb_batchedsnaps, cb.cb_defer_destroy);
 		}
-		if (err != 0) {
+		if (err != 0)
 			rv = 1;
-		} else if (wait) {
-                        rv = zpool_wait(zhp, ZPOOL_WAIT_DESTROY);
-		}
 	}
 
 out:
