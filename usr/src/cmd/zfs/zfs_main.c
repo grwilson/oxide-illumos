@@ -1426,9 +1426,10 @@ zfs_do_destroy(int argc, char **argv)
 	zfs_handle_t *zhp = NULL;
 	char *at, *pound;
 	zfs_type_t type = ZFS_TYPE_DATASET;
+	boolean_t wait = B_FALSE;
 
 	/* check options */
-	while ((c = getopt(argc, argv, "vpndfrR")) != -1) {
+	while ((c = getopt(argc, argv, "vpndfrRw")) != -1) {
 		switch (c) {
 		case 'v':
 			cb.cb_verbose = B_TRUE;
@@ -1453,6 +1454,9 @@ zfs_do_destroy(int argc, char **argv)
 		case 'R':
 			cb.cb_recurse = B_TRUE;
 			cb.cb_doclones = B_TRUE;
+			break;
+		case 'w':
+			wait = B_TRUE;
 			break;
 		case '?':
 		default:
@@ -1635,8 +1639,11 @@ zfs_do_destroy(int argc, char **argv)
 			err = zfs_destroy_snaps_nvl(g_zfs,
 			    cb.cb_batchedsnaps, cb.cb_defer_destroy);
 		}
-		if (err != 0)
+		if (err != 0) {
 			rv = 1;
+		} else if (wait) {
+                        rv = zpool_wait(zhp, ZPOOL_WAIT_DESTROY);
+		}
 	}
 
 out:
