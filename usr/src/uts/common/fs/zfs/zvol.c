@@ -2241,6 +2241,7 @@ zvol_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *cr, int *rvalp)
 		}
 
 		mutex_enter(&zv->zv_state_lock);
+		mutex_exit(&zfsdev_state_lock);
 
 		bzero(&drs, sizeof (drs));
 		drs.drs_vers = 1;
@@ -2270,7 +2271,6 @@ zvol_ioctl(dev_t dev, int cmd, intptr_t arg, int flag, cred_t *cr, int *rvalp)
 		}
 out:
 		mutex_exit(&zv->zv_state_lock);
-		mutex_exit(&zfsdev_state_lock);
 
 		if (ddi_copyout(&drs, (void *)arg, sizeof (drs), flag))
 			error = SET_ERROR(EFAULT);
@@ -2285,6 +2285,7 @@ out:
 		}
 
 		mutex_enter(&zv->zv_state_lock);
+		mutex_exit(&zfsdev_state_lock);
 
 		/*
 		 * The first open of a raw volume will always start
@@ -2298,7 +2299,6 @@ out:
 			if (cv_wait_sig(&zv->zv_state_cv,
 			    &zv->zv_state_lock) == 0) {
 				mutex_exit(&zv->zv_state_lock);
-				mutex_exit(&zfsdev_state_lock);
 				return (SET_ERROR(EINTR));
 			}
 		}
@@ -2308,12 +2308,10 @@ out:
 			if (cv_wait_sig(&zv->zv_state_cv,
 			    &zv->zv_state_lock) == 0) {
 				mutex_exit(&zv->zv_state_lock);
-				mutex_exit(&zfsdev_state_lock);
 				return (SET_ERROR(EINTR));
 			}
 		}
 		mutex_exit(&zv->zv_state_lock);
-		mutex_exit(&zfsdev_state_lock);
 		return (0);
 	}
 
