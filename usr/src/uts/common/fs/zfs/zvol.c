@@ -201,6 +201,12 @@ boolean_t zvol_unmap_enabled = B_TRUE;
  */
 boolean_t zvol_unmap_sync_enabled = B_FALSE;
 
+/*
+ * Defines the percentage of blocks that can come from the initialization
+ * process.
+ */
+uint32_t zvol_per_txg_zero_percent = 20;
+
 extern int zfs_set_prop_nvlist(const char *, zprop_source_t,
     nvlist_t *, nvlist_t *);
 static int zvol_remove_zv(zvol_state_t *);
@@ -868,6 +874,16 @@ zvol_raw_max_blocksize(zvol_state_t *zv)
 	return (blocksize);
 }
 
+/*
+ * Track the number of bytes zeroed across all concurrent zvol_zero()
+ * calls. This allows us to provide a loose rate-limiting throttle. We
+ * update this atomically but read without a lock. It is declared
+ * volatile to prevent the compiler from caching the value across loop
+ * iterations. A slightly stale read is acceptable here — the goal is
+ * approximate throttling, not strict enforcement.
+ */
+volatile uint64_t zvol_zero_bytes;
+
 static int
 zvol_zero(zvol_state_t *zv)
 {
@@ -876,6 +892,7 @@ zvol_zero(zvol_state_t *zv)
 	uint64_t resid, bytes_zeroed = 0;
 	int error = 0;
 	uint64_t blocksize = zv->zv_volblocksize;
+	uint64_t zvol_max_zero_bytes;
 
 	ASSERT(MUTEX_HELD(&zv->zv_state_lock));
 
@@ -891,7 +908,16 @@ zvol_zero(zvol_state_t *zv)
 	} else {
 		resid -= zv->zv_zero_off;
 	}
+
+	if (zvol_per_txg_zero_percent <= 100) {
+		zvol_max_zero_bytes = zvol_per_txg_zero_percent *
+		    zfs_dirty_data_max / 100;
+	} else {
+		zvol_max_zero_bytes = zfs_dirty_data_max;
+	}
+
 	while (resid != 0 && !zv->zv_zero_exit_wanted) {
+		uint64_t bytes = 0;
 
 		mutex_exit(&zv->zv_state_lock);
 
@@ -903,7 +929,13 @@ zvol_zero(zvol_state_t *zv)
 		if (zv->zv_zero_off == 0 && !(zv->zv_flags & ZVOL_DUMPIFIED)) {
 			blocksize = zvol_raw_max_blocksize(zv);
 		}
-		uint64_t bytes = MIN(resid, blocksize);
+		bytes = MIN(resid, blocksize);
+
+		if (zvol_max_zero_bytes != 0 &&
+		    zvol_zero_bytes >= zvol_max_zero_bytes) {
+			txg_wait_open(dmu_objset_pool(os), 0, B_TRUE);
+			atomic_swap_64(&zvol_zero_bytes, 0);
+		}
 
 		tx = dmu_tx_create(os);
 		dmu_tx_hold_write(tx, ZVOL_OBJ, zv->zv_zero_off, bytes);
@@ -935,6 +967,8 @@ zvol_zero(zvol_state_t *zv)
 		    (zv->zv_flags & ZVOL_DUMPIFIED), tx);
 
 		bytes_zeroed += bytes;
+		atomic_add_64(&zvol_zero_bytes, bytes);
+
 		resid -= bytes;
 		dmu_tx_commit(tx);
 
@@ -943,6 +977,7 @@ zvol_zero(zvol_state_t *zv)
 	}
 	if (bytes_zeroed > 0) {
 		txg_wait_synced(dmu_objset_pool(os), 0);
+		atomic_swap_64(&zvol_zero_bytes, 0);
 
 		if (zv->zv_zero_exit_wanted) {
 			zfs_dbgmsg("zvol_zero shutting down: zv %p, flags %d, "
