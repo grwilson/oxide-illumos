@@ -74,6 +74,7 @@
 
 #include <sys/dumphdr.h>
 #include <sys/bootconf.h>
+#include <sys/bootmem.h>
 #include <sys/memlist_plat.h>
 #include <sys/varargs.h>
 #include <sys/promif.h>
@@ -730,6 +731,7 @@ startup(void)
 #endif
 	startup_memlist();
 	startup_kmem();
+	bootmem_init();
 	startup_vm();
 #if !defined(__xpv)
 	/*

@@ -74,6 +74,7 @@
 
 #include <sys/dumphdr.h>
 #include <sys/bootconf.h>
+#include <sys/bootmem.h>
 #include <sys/memlist_plat.h>
 #include <sys/varargs.h>
 #include <sys/promif.h>
@@ -659,6 +660,7 @@ startup(void)
 	startup_memlist();
 	oxide_report_boot_stage(BOOT_STAGE_STARTUP_KMEM);
 	startup_kmem();
+	bootmem_init();
 	oxide_report_boot_stage(BOOT_STAGE_STARTUP_VM);
 	startup_vm();
 

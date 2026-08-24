@@ -38,6 +38,7 @@
 #
 CORE_OBJS +=		\
 	arch_kdi.o	\
+	bootmem.o	\
 	comm_page_util.o \
 	copy.o		\
 	copy_subr.o	\
