@@ -676,6 +676,25 @@ wait_for_psp(void)
  * greater knowledge and control of our environment, sufficiently so that one
  * day this might look more like the sun4 code than i86pc.
  */
+
+/*
+ * Coarse total installed page count, summed directly from the raw boot
+ * memlist.  Used only as the percentage reference for BOOTMEM_SIZE_PROP --
+ * deliberately not the more precise, kernel-occupied-subtracted npages
+ * startup_memlist() computes later, since that isn't known this early.
+ */
+static pgcnt_t
+total_installed_pages(void)
+{
+	struct memlist *ml;
+	pgcnt_t pages = 0;
+
+	for (ml = bm.physinstalled; ml != NULL; ml = ml->ml_next)
+		pages += btop(ml->ml_size);
+
+	return (pages);
+}
+
 void
 _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 {
@@ -734,6 +753,47 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	if (reset_vector != 0) {
 		eb_physmem_reserve_range(reset_vector & PAGEMASK, PAGESIZE,
 		    EBPR_NO_ALLOC);
+	}
+
+	/*
+	 * Read BOOTMEM_SIZE_PROP and, if set, withhold the top bootmem_pages
+	 * of memory from the early-boot allocator (eb_phys_alloc(), via
+	 * eb_alloc()) from this point on -- before _kobj_boot() loads kernel
+	 * modules and before startup_memlist()'s own perform_allocations()
+	 * runs, either of which could otherwise land inside the very range
+	 * later withheld from page_t management, causing boot_mapin() to
+	 * panic looking for a page_t that was never created.  A naive,
+	 * hole-unaware "top of the installed range" is used here rather
+	 * than a precise walk: EBPR_NO_ALLOC is harmless to apply to bytes
+	 * that were never actually installed, so this is safe, if slightly
+	 * conservative.  bootmem_pages itself is consumed again, unchanged,
+	 * by startup_memlist() to build phys_avail/phys_bootmem precisely
+	 * once the real (kernel-occupied-subtracted) page count is known.
+	 */
+	uint64_t bootmem_bytes;
+
+	if (bootprop_getsize(BOOTMEM_SIZE_PROP, ptob(total_installed_pages()),
+	    &bootmem_bytes) == 0)
+		bootmem_pages = btop(bootmem_bytes);
+	else
+		bootmem_pages = 0;
+
+	if (bootmem_pages > 0) {
+		pgcnt_t total = total_installed_pages();
+		struct memlist *ml;
+		uint64_t top = 0;
+
+		if (bootmem_pages > total)
+			bootmem_pages = total;
+
+		for (ml = bm.physinstalled; ml != NULL; ml = ml->ml_next) {
+			uint64_t end = ml->ml_address + ml->ml_size;
+			if (end > top)
+				top = end;
+		}
+
+		eb_physmem_reserve_range(top - ptob(bootmem_pages),
+		    ptob(bootmem_pages), EBPR_NO_ALLOC);
 	}
 
 	/*
@@ -809,6 +869,143 @@ bootprop_getstr(const char *prop_name, char *buf, size_t buflen)
 	if (boot_prop_len < 0 || boot_prop_len >= buflen ||
 	    BOP_GETPROP(bootops, prop_name, buf) < 0)
 		return (-1);
+
+	return (0);
+}
+
+/*
+ * Minimal early-boot-safe integer parser (decimal, or "0x"/"0" for hex/octal),
+ * used only by bootprop_getsize() below.  This deliberately does not use the
+ * common kobj_getvalue(): that lives in genunix, which krtld/_kobj_boot() has
+ * not yet loaded and relocated calls into at the point bootprop_getsize() is
+ * called from _start() -- calling it there faults at a fixed (call-target)
+ * address regardless of the property's actual value.
+ */
+static int
+parse_value(const char *p, uint64_t *retval)
+{
+	uint64_t tmp = 0;
+	int digit;
+	int radix = 10;
+
+	if (*p == '0') {
+		++p;
+		if (*p == 0) {
+			*retval = 0;
+			return (0);
+		}
+		if (*p == 'x' || *p == 'X') {
+			radix = 16;
+			++p;
+		} else {
+			radix = 8;
+			++p;
+		}
+	}
+	while (*p) {
+		if ('0' <= *p && *p <= '9')
+			digit = *p - '0';
+		else if ('a' <= *p && *p <= 'f')
+			digit = 10 + *p - 'a';
+		else if ('A' <= *p && *p <= 'F')
+			digit = 10 + *p - 'A';
+		else
+			return (-1);
+		if (digit >= radix)
+			return (-1);
+		tmp = tmp * radix + digit;
+		++p;
+	}
+	*retval = tmp;
+	return (0);
+}
+
+/*
+ * Like bootprop_getval(), but the property value may carry an optional
+ * trailing k/K, m/M, g/G, or t/T suffix (base-1024) scaling it into a byte
+ * count, or a trailing '%' expressing it as an integer percentage of
+ * `total` (also a byte count -- e.g. total installed memory).  A value
+ * with no recognized suffix is returned unscaled.  Percentages above 100
+ * are rejected rather than clamped, since that's almost certainly an
+ * operator mistake rather than an intentional request.
+ */
+/* XXX shareable */
+int
+bootprop_getsize(const char *prop_name, uint64_t total, uint64_t *prop_value)
+{
+	int		boot_prop_len;
+	char		str[BP_MAX_STRLEN];
+	uint64_t	value;
+	uint64_t	scale = 1;
+	size_t		len;
+	boolean_t	is_pct = B_FALSE;
+
+	/*
+	 * Unlike bootprop_getval()/bootprop_getstr(), this is called from
+	 * _start() -- before _kobj_boot() hands off and the global bootops
+	 * pointer that BOP_GETPROPLEN()/BOP_GETPROP() dereference is set up
+	 * (it is 0 until then; see "passed in from boot" in startup.c) -- so
+	 * this must call do_bsys_getproplen()/do_bsys_getprop() directly,
+	 * same as the existing "physmem" property handling does, rather
+	 * than through those macros.
+	 */
+	boot_prop_len = do_bsys_getproplen(NULL, prop_name);
+	if (boot_prop_len < 0 || boot_prop_len >= sizeof (str) ||
+	    do_bsys_getprop(NULL, prop_name, str) < 0)
+		return (-1);
+
+	len = strlen(str);
+	if (len > 0) {
+		switch (str[len - 1]) {
+		case 'K':
+		case 'k':
+			scale = 1ULL << 10;
+			str[len - 1] = '\0';
+			break;
+		case 'M':
+		case 'm':
+			scale = 1ULL << 20;
+			str[len - 1] = '\0';
+			break;
+		case 'G':
+		case 'g':
+			scale = 1ULL << 30;
+			str[len - 1] = '\0';
+			break;
+		case 'T':
+		case 't':
+			scale = 1ULL << 40;
+			str[len - 1] = '\0';
+			break;
+		case '%':
+			is_pct = B_TRUE;
+			str[len - 1] = '\0';
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (parse_value(str, &value) == -1)
+		return (-1);
+
+	if (is_pct) {
+		if (value > 100)
+			return (-1);
+		/* overflow check */
+		if (value != 0 && (-1ULL / value) < total)
+			return (-1);
+		if (prop_value != NULL)
+			*prop_value = (total * value) / 100;
+		return (0);
+	}
+
+	/* overflow check */
+	if (value != 0 && (-1ULL / scale) < value)
+		return (-1);
+
+	if (prop_value != NULL)
+		*prop_value = value * scale;
 
 	return (0);
 }

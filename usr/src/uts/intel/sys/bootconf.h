@@ -243,6 +243,19 @@ extern void read_bootenvrc(void);
 
 extern int bootprop_getval(const char *, u_longlong_t *);
 extern int bootprop_getstr(const char *, char *, size_t);
+extern int bootprop_getsize(const char *, uint64_t, uint64_t *);
+
+/*
+ * Amount of memory (bytes, with an optional k/M/G/T suffix or a '%' of
+ * total installed memory) to withhold from page_t/memseg management at
+ * boot -- see bootprop_getsize() and startup_memlist()'s use of
+ * bootmem_pages/bootmem_before/bootmem_resv.  Read and applied as early as
+ * possible in fakebop.c (alongside `physmem`'s own handling), since any
+ * later point risks the early-boot physical allocator having already
+ * placed something inside the reserved region.
+ */
+#define	BOOTMEM_SIZE_PROP	"bootmem-size"
+extern pgcnt_t bootmem_pages;
 
 /*
  * Back door to fakebop.c to get physical memory allocated.

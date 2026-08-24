@@ -111,6 +111,16 @@ static paddr_t next_phys;	/* next available physical address from dboot */
 static paddr_t high_phys = -(paddr_t)1;	/* last used physical address */
 
 /*
+ * Upper bound (in pages) on what do_bop_phys_alloc() may hand out, imposed
+ * by the bootmem reservation computed in startup_memlist() -- see
+ * bop_set_bootmem_ceiling().  0 means no additional limit is in effect.
+ * Kept independent of `physmem` deliberately: conflating this with an
+ * operator's own physmem= setting (and its accompanying orig_npages
+ * warning) would make both harder to reason about and report accurately.
+ */
+static pgcnt_t bootmem_ceiling_pages = 0;
+
+/*
  * buffer for vsnprintf for console I/O
  */
 #define	BUFFERSIZE	512
@@ -215,6 +225,16 @@ do_bop_phys_alloc(uint64_t size, uint64_t align)
 		high_phys = pfn_to_pa(physmem);
 
 	/*
+	 * Likewise for the bootmem reservation, if one has been set up by
+	 * startup_memlist() -- keeps this allocator (and anything it backs,
+	 * e.g. perform_allocations()'s valloc_base region) out of the memory
+	 * withheld for page_t-less use.
+	 */
+	if (bootmem_ceiling_pages != 0 &&
+	    high_phys > pfn_to_pa(bootmem_ceiling_pages))
+		high_phys = pfn_to_pa(bootmem_ceiling_pages);
+
+	/*
 	 * find the highest available memory in physinstalled
 	 */
 	size = P2ROUNDUP(size, align);
@@ -253,6 +273,20 @@ do_bop_phys_alloc(uint64_t size, uint64_t align)
 	bop_panic("do_bop_phys_alloc(0x%" PRIx64 ", 0x%" PRIx64
 	    ") Out of memory\n", size, align);
 	/*NOTREACHED*/
+}
+
+/*
+ * Called by startup_memlist() once it has computed how many pages are to
+ * be withheld from page_t/memseg management for the bootmem reservation
+ * (BOOTMEM_SIZE_PROP), before perform_allocations() runs.  This keeps
+ * do_bop_phys_alloc() -- and anything it backs -- out of that reserved
+ * region, without touching `physmem` or its own reconciliation/warning
+ * semantics.
+ */
+void
+bop_set_bootmem_ceiling(pgcnt_t pages)
+{
+	bootmem_ceiling_pages = pages;
 }
 
 uintptr_t
@@ -671,6 +705,27 @@ boot_prop_display(char *buffer)
  *
  * we do single character I/O since this is really just looking at memory
  */
+
+/*
+ * Coarse total installed page count, summed directly from the raw boot
+ * memlist.  Used only as the percentage reference for BOOTMEM_SIZE_PROP
+ * (see bop_set_bootmem_ceiling() below) -- deliberately not the more
+ * precise, kernel-occupied-subtracted npages startup_memlist() computes
+ * later, since that isn't known this early.
+ */
+static pgcnt_t
+total_installed_pages(void)
+{
+	struct memlist *ml;
+	pgcnt_t pages = 0;
+
+	for (ml = (struct memlist *)xbootp->bi_phys_install; ml != NULL;
+	    ml = ml->ml_next)
+		pages += btop(ml->ml_size);
+
+	return (pages);
+}
+
 void
 read_bootenvrc(void)
 {
@@ -817,6 +872,36 @@ done:
 			DBG(physmem);
 		}
 	}
+
+	/*
+	 * Read BOOTMEM_SIZE_PROP and, if set, keep do_bop_phys_alloc() out of
+	 * the top bootmem_pages of memory from this point on -- before
+	 * early_allocation is cleared below and everything that follows
+	 * (bootenvrc property storage, ACPI table copies, _kobj_boot()'s
+	 * module loading, and eventually startup_memlist()'s own
+	 * perform_allocations()) starts competing for the highest available
+	 * addresses.  bootmem_pages itself is consumed again, unchanged,
+	 * by startup_memlist() to build phys_avail/phys_bootmem once the
+	 * precise (kernel-occupied-subtracted) page count is known; this
+	 * uses only a coarse total (total_installed_pages()) for any '%'
+	 * reference, since that precise count isn't available yet.
+	 */
+	uint64_t bootmem_bytes;
+
+	if (bootprop_getsize(BOOTMEM_SIZE_PROP, ptob(total_installed_pages()),
+	    &bootmem_bytes) == 0)
+		bootmem_pages = btop(bootmem_bytes);
+	else
+		bootmem_pages = 0;
+
+	if (bootmem_pages > 0) {
+		pgcnt_t total = total_installed_pages();
+
+		if (bootmem_pages > total)
+			bootmem_pages = total;
+		bop_set_bootmem_ceiling(total - bootmem_pages);
+	}
+
 	early_allocation = 0;
 
 	/*
@@ -3054,6 +3139,100 @@ bootprop_getstr(const char *prop_name, char *buf, size_t buflen)
 	if (boot_prop_len < 0 || boot_prop_len >= buflen ||
 	    BOP_GETPROP(bootops, prop_name, buf) < 0)
 		return (-1);
+
+	return (0);
+}
+
+/*
+ * Like bootprop_getval(), but the property value may carry an optional
+ * trailing k/K, m/M, g/G, or t/T suffix (base-1024) scaling it into a byte
+ * count, or a trailing '%' expressing it as an integer percentage of
+ * `total` (also a byte count -- e.g. total installed memory).  A value
+ * with no recognized suffix is returned unscaled.  Percentages above 100
+ * are rejected rather than clamped, since that's almost certainly an
+ * operator mistake rather than an intentional request.
+ */
+int
+bootprop_getsize(const char *prop_name, uint64_t total, uint64_t *prop_value)
+{
+	int		boot_prop_len;
+	char		str[BP_MAX_STRLEN];
+	uint64_t	value;
+	uint64_t	scale = 1;
+	size_t		len;
+	boolean_t	is_pct = B_FALSE;
+
+	/*
+	 * Unlike bootprop_getval()/bootprop_getstr(), this is called from
+	 * read_bootenvrc() -- before the global bootops pointer that
+	 * BOP_GETPROPLEN()/BOP_GETPROP() dereference is set up by the
+	 * kernel proper -- so this must call
+	 * do_bsys_getproplen()/do_bsys_getprop() directly, same as the
+	 * existing "physmem" property handling just above does, rather
+	 * than through those macros.  For the same reason, the numeral is
+	 * parsed with the local parse_value() rather than kobj_getvalue():
+	 * the latter lives in genunix, which krtld/_kobj_boot() has not yet
+	 * loaded and relocated calls into at this point in boot -- calling
+	 * it here faults at a fixed (call-target) address regardless of the
+	 * property's actual value, which is exactly what was observed.
+	 */
+	boot_prop_len = do_bsys_getproplen(NULL, prop_name);
+	if (boot_prop_len < 0 || boot_prop_len >= sizeof (str) ||
+	    do_bsys_getprop(NULL, prop_name, str) < 0)
+		return (-1);
+
+	len = strlen(str);
+	if (len > 0) {
+		switch (str[len - 1]) {
+		case 'K':
+		case 'k':
+			scale = 1ULL << 10;
+			str[len - 1] = '\0';
+			break;
+		case 'M':
+		case 'm':
+			scale = 1ULL << 20;
+			str[len - 1] = '\0';
+			break;
+		case 'G':
+		case 'g':
+			scale = 1ULL << 30;
+			str[len - 1] = '\0';
+			break;
+		case 'T':
+		case 't':
+			scale = 1ULL << 40;
+			str[len - 1] = '\0';
+			break;
+		case '%':
+			is_pct = B_TRUE;
+			str[len - 1] = '\0';
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (parse_value(str, &value) == -1)
+		return (-1);
+
+	if (is_pct) {
+		if (value > 100)
+			return (-1);
+		/* overflow check */
+		if (value != 0 && (-1ULL / value) < total)
+			return (-1);
+		if (prop_value != NULL)
+			*prop_value = (total * value) / 100;
+		return (0);
+	}
+
+	/* overflow check */
+	if (value != 0 && (-1ULL / scale) < value)
+		return (-1);
+
+	if (prop_value != NULL)
+		*prop_value = value * scale;
 
 	return (0);
 }
