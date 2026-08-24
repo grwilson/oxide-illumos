@@ -920,30 +920,55 @@ avail_filter(uint64_t *addr, uint64_t *size)
  * since each pass fully drains them as it walks).  Candidate ranges are
  * first trimmed of kernel-occupied memory and page zero, same as
  * avail_filter().
+ *
+ * Unlike avail_filter(), this cannot simply return size=0 once a
+ * trim_kernel_occupied()-bounded sub-window is fully skipped: doing so
+ * would tell copy_memlist_filter() "nothing further remains in this
+ * source span" (its contract for a size-0 return), even though the
+ * reservation itself may lie much further into the very same span, past
+ * one or more kernel/ACPI-occupied sub-ranges.  avail_filter() gets away
+ * with an early size=0 because its only such return is *always* final --
+ * once past the reservation boundary, nothing later in the span is ever
+ * avail-eligible anyway.  Here, we must instead loop internally,
+ * re-discovering the next sub-window after each fully-consumed skip,
+ * using the source span's true end (preserved on entry, since
+ * copy_memlist_filter() only hands us the *current* remainder) to keep
+ * re-deriving an accurate window on each iteration.
  */
 static void
 bootmem_filter(uint64_t *addr, uint64_t *size)
 {
-	trim_kernel_occupied(addr, size);
-	if (*size == 0)
-		return;
+	uint64_t span_end = *addr + *size;
 
-	pgcnt_t pages = *size >> MMU_PAGESHIFT;
-
-	if (bootmem_before > 0) {
-		pgcnt_t skip = MIN(bootmem_before, pages);
-
-		bootmem_before -= skip;
-		*addr += ptob(skip);
-		*size -= ptob(skip);
-		pages -= skip;
+	for (;;) {
+		*size = span_end - *addr;
+		trim_kernel_occupied(addr, size);
 		if (*size == 0)
 			return;
-	}
 
-	if (pages > bootmem_resv)
-		*size = ptob(bootmem_resv);
-	bootmem_resv -= *size >> MMU_PAGESHIFT;
+		pgcnt_t pages = *size >> MMU_PAGESHIFT;
+
+		if (bootmem_before > 0) {
+			pgcnt_t skip = MIN(bootmem_before, pages);
+
+			bootmem_before -= skip;
+			*addr += ptob(skip);
+			if (skip == pages) {
+				/*
+				 * This sub-window was fully skipped; loop to
+				 * find the next one before span_end.
+				 */
+				continue;
+			}
+			*size -= ptob(skip);
+			pages -= skip;
+		}
+
+		if (pages > bootmem_resv)
+			*size = ptob(bootmem_resv);
+		bootmem_resv -= *size >> MMU_PAGESHIFT;
+		return;
+	}
 }
 
 static void

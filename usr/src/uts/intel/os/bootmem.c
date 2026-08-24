@@ -25,6 +25,7 @@
 #include <sys/sysmacros.h>
 #include <sys/vmem.h>
 #include <sys/memlist.h>
+#include <sys/bootconf.h>
 #include <sys/bootmem.h>
 #include <vm/page.h>
 
@@ -36,7 +37,16 @@ bootmem_init(void)
 {
 	struct memlist *ml;
 
-	if (phys_bootmem == NULL)
+	/*
+	 * phys_bootmem is always a valid, non-NULL pointer once
+	 * perform_allocations() has run -- it's part of the unconditionally
+	 * sized valloc_base region.  When BOOTMEM_SIZE_PROP is unset (or
+	 * clamped to 0), bootmem_filter() never actually writes any entries
+	 * into it, leaving it pointing at raw, zeroed memory (ml_address ==
+	 * 0, ml_size == 0).  bootmem_pages -- not phys_bootmem's pointer
+	 * value -- is the real signal for "was anything reserved".
+	 */
+	if (bootmem_pages == 0)
 		return;
 
 	bootmem_arena = vmem_create("bootmem", NULL, 0, 1,
