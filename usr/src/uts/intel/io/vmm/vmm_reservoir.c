@@ -1389,6 +1389,11 @@ vmmr_ioctl(int cmd, intptr_t arg, int md, cred_t *cr, int *rvalp)
 		res.vrq_alloc_transient_sz = vmmr_alloc_transient_sz;
 		res.vrq_limit = vmmr_total_limit;
 		mutex_exit(&vmmr_lock);
+
+		pgcnt_t bootmem_total, bootmem_free;
+		bootmem_query(&bootmem_total, &bootmem_free);
+		res.vrq_bootmem_total_sz = bootmem_total << PAGESHIFT;
+		res.vrq_bootmem_free_sz = bootmem_free << PAGESHIFT;
 		if (ddi_copyout(&res, datap, sizeof (res), md) != 0) {
 			return (EFAULT);
 		}

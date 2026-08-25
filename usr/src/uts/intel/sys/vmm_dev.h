@@ -333,6 +333,14 @@ struct vmm_resv_query {
 	size_t	vrq_alloc_sz;
 	size_t	vrq_alloc_transient_sz;
 	size_t	vrq_limit;
+
+	/*
+	 * Total and free capacity of the boot-time bootmem pool (see
+	 * sys/bootmem.h), regardless of whether it is currently backing the
+	 * reservoir.  Both are 0 when no bootmem reservation was configured.
+	 */
+	size_t	vrq_bootmem_total_sz;
+	size_t	vrq_bootmem_free_sz;
 };
 
 struct vmm_resv_target {

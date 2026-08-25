@@ -162,11 +162,15 @@ do_query(int fd)
 	printf("Free MiB:\t%zu\n"
 	    "Allocated MiB:\t%zu\n"
 	    "Transient Allocated MiB:\t%zu\n"
-	    "Size limit MiB:\t%zu\n",
+	    "Size limit MiB:\t%zu\n"
+	    "Bootmem total MiB:\t%zu\n"
+	    "Bootmem free MiB:\t%zu\n",
 	    data.vrq_free_sz / (1024 * 1024),
 	    data.vrq_alloc_sz / (1024 * 1024),
 	    data.vrq_alloc_transient_sz / (1024 * 1024),
-	    data.vrq_limit / (1024 * 1024));
+	    data.vrq_limit / (1024 * 1024),
+	    data.vrq_bootmem_total_sz / (1024 * 1024),
+	    data.vrq_bootmem_free_sz / (1024 * 1024));
 }
 
 int
