@@ -21,7 +21,7 @@ PRE_INC_PATH	= \
 
 INC_PATH	+= -I$(UTSBASE)/intel/io/vmm
 
-LDFLAGS		+= -N drv/vmm -N drv/ktest
+LDFLAGS		+= -N drv/ktest
 
 VMM_KTEST_OBJS = \
 	vmm_reservoir_ktest.o
