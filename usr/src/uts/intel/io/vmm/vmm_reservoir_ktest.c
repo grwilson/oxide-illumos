@@ -185,13 +185,20 @@ cleanup:
 }
 
 /*
- * Grow the reservoir by more than the bootmem pool's total capacity, and
- * confirm the allocation still succeeds (the excess falling through to the
- * ordinary page_t-backed paths) while bootmem's free capacity bottoms out
- * at zero rather than producing an error.
+ * Grow the reservoir by a few pages more than the bootmem pool's total
+ * capacity, and confirm the allocation still succeeds (the excess falling
+ * through to the single-page page_create_va() fallback) while bootmem's
+ * free capacity bottoms out at zero rather than producing an error.
+ *
+ * page_xresv() now reserves availrmem only for the pages actually sourced
+ * from the ordinary pool (see vmmr_alloc_pages()), not the request as a
+ * whole, so the excess here no longer needs to be kept to an absolute
+ * minimum to avoid blocking under memory pressure -- it just needs to stay
+ * smaller than a large page (see vmmr_ktest_bootmem_overflow_large below
+ * for that case) so it reliably exercises the single-page path alone.
  */
 static void
-vmmr_ktest_bootmem_overflow(ktest_ctx_hdl_t *ctx)
+vmmr_ktest_bootmem_overflow_small(ktest_ctx_hdl_t *ctx)
 {
 	pgcnt_t total, free_before;
 
@@ -214,7 +221,7 @@ vmmr_ktest_bootmem_overflow(ktest_ctx_hdl_t *ctx)
 		goto cleanup;
 	}
 
-	const pgcnt_t req_pages = total + 16;
+	const pgcnt_t req_pages = total + 4;
 	const size_t sz = req_pages << PAGESHIFT;
 
 	const int err = fns.vkf_alloc(sz, true, &region);
@@ -222,6 +229,85 @@ vmmr_ktest_bootmem_overflow(ktest_ctx_hdl_t *ctx)
 		KT_SKIP(ctx, "reservoir limit too small for overflow test");
 		goto cleanup;
 	}
+
+	pgcnt_t free_after;
+	bootmem_query(NULL, &free_after);
+	KT_ASSERT3UG(free_after, ==, 0, ctx, cleanup_region);
+
+	(void) fns.vkf_pfn_at(region, 0);
+	(void) fns.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
+
+	fns.vkf_free(region);
+	region = NULL;
+
+	pgcnt_t free_restored;
+	bootmem_query(NULL, &free_restored);
+	KT_ASSERT3UG(free_restored, ==, free_before, ctx, cleanup);
+
+	KT_PASS(ctx);
+	goto cleanup;
+
+cleanup_region:
+	fns.vkf_free(region);
+cleanup:
+	if (hdl != NULL) {
+		ktest_release_mod(hdl);
+	}
+}
+
+/*
+ * Grow the reservoir past bootmem's total capacity by enough to force a
+ * full large-page-sized chunk through the ordinary path, exercising
+ * vmmr_alloc_large()/page_xresv(vmmr_lpgcnt, ...) -- the branch
+ * vmmr_ktest_bootmem_overflow_small's single-page excess never reaches.
+ *
+ * vmmr_lpgcnt is not part of vmm's exported API (nor a function), but
+ * ktest_get_fn() resolves any named symbol via the module's full symbol
+ * table, function or data alike, so it works here too: the returned
+ * pointer is the address of the static variable itself.
+ */
+static void
+vmmr_ktest_bootmem_overflow_large(ktest_ctx_hdl_t *ctx)
+{
+	pgcnt_t total, free_before;
+
+	bootmem_query(&total, &free_before);
+	if (total == 0) {
+		KT_SKIP(ctx, "no bootmem reservation configured");
+		return;
+	}
+
+	ddi_modhandle_t hdl = NULL;
+	vmmr_ktest_fns_t fns = { 0 };
+	vmmr_region_t *region = NULL;
+
+	if (ktest_hold_mod("drv/vmm", &hdl) != 0) {
+		KT_ERROR(ctx, "failed to hold 'vmm' module");
+		return;
+	}
+	if (vmmr_ktest_resolve(hdl, &fns) != 0) {
+		KT_ERROR(ctx, "failed to resolve vmm reservoir symbols");
+		goto cleanup;
+	}
+
+	pgcnt_t *lpgcnt_ptr = NULL;
+	if (ktest_get_fn(hdl, "vmmr_lpgcnt", (void **)&lpgcnt_ptr) != 0 ||
+	    *lpgcnt_ptr == 0) {
+		KT_SKIP(ctx, "platform has no large page support");
+		goto cleanup;
+	}
+	const pgcnt_t lpgcnt = *lpgcnt_ptr;
+
+	/*
+	 * However bootmem's own capacity happens to align, two full large
+	 * pages of excess guarantees at least one large-page-aligned,
+	 * large-page-sized chunk is left over for the ordinary path once
+	 * bootmem is exhausted.
+	 */
+	const pgcnt_t req_pages = total + (2 * lpgcnt);
+	const size_t sz = req_pages << PAGESHIFT;
+
+	KT_EASSERT0G(fns.vkf_alloc(sz, true, &region), ctx, cleanup);
 
 	pgcnt_t free_after;
 	bootmem_query(NULL, &free_after);
@@ -271,8 +357,10 @@ _init(void)
 	    vmmr_ktest_basic_alloc_free, KTEST_FLAG_NONE));
 	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_engaged",
 	    vmmr_ktest_bootmem_engaged, KTEST_FLAG_NONE));
-	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_overflow",
-	    vmmr_ktest_bootmem_overflow, KTEST_FLAG_NONE));
+	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_overflow_small",
+	    vmmr_ktest_bootmem_overflow_small, KTEST_FLAG_NONE));
+	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_overflow_large",
+	    vmmr_ktest_bootmem_overflow_large, KTEST_FLAG_NONE));
 
 	if ((ret = ktest_register_module(km)) != 0) {
 		ktest_free_module(km);

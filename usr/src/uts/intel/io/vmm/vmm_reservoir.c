@@ -272,6 +272,7 @@ typedef struct vmmr_kstats {
 static int vmmr_add(size_t, bool);
 static int vmmr_remove(size_t, bool);
 static vmmr_bootmem_chunk_t *vmmr_bootmem_find(uintptr_t);
+static int vmmr_resv_wait();
 
 static int
 vmmr_cmp_addr(const void *a, const void *b)
@@ -921,7 +922,10 @@ vmmr_destroy_pages(vmmr_span_t *span)
 
 		/*
 		 * Clear p_lckcnt so page_destroy() doesn't update availrmem.
-		 * That will be taken care of later via page_unresv().
+		 * That is taken care of explicitly below via page_unresv(),
+		 * matching the page_xresv() done when this page (or its
+		 * large-page group) was originally sourced in
+		 * vmmr_alloc_pages().
 		 */
 		pp->p_lckcnt = 0;
 
@@ -942,11 +946,13 @@ vmmr_destroy_pages(vmmr_span_t *span)
 				kmem_free(group->vl_freemap,
 				    BT_SIZEOFMAP(vmmr_lpgcnt));
 				kmem_free(group, sizeof (*group));
+				page_unresv(vmmr_lpgcnt);
 			}
 			continue;
 		}
 
 		page_destroy(pp, 0);
+		page_unresv(1);
 	}
 }
 
@@ -1050,6 +1056,7 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 
 	const uintptr_t end = span->vs_addr + span->vs_size;
 	uintptr_t pos = span->vs_addr;
+	int err;
 
 	while (pos < end) {
 		const uintptr_t remain = end - pos;
@@ -1069,9 +1076,33 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 			continue;
 		}
 
-		if (lpg_aligned && vmmr_alloc_large(vp, &kseg, pos) == 0) {
-			pos += vmmr_lpgsz;
-			continue;
+		/*
+		 * Neither bootmem attempt succeeded (exhausted, or never
+		 * configured), so this page must come from the ordinary
+		 * page_t-backed paths.  Unlike bootmem, those draw from the
+		 * general system page pool, so availrmem must be reserved
+		 * via page_xresv() for exactly the pages sourced this way,
+		 * immediately before sourcing them -- reserving any more
+		 * (e.g. up front for the whole request, regardless of how
+		 * much of it bootmem could cover) would block unnecessarily
+		 * under memory pressure.
+		 */
+		if (lpg_aligned) {
+			if (page_xresv(vmmr_lpgcnt, KM_SLEEP,
+			    vmmr_resv_wait) == 0) {
+				err = EINTR;
+				goto unwind;
+			}
+			if (vmmr_alloc_large(vp, &kseg, pos) == 0) {
+				pos += vmmr_lpgsz;
+				continue;
+			}
+			page_unresv(vmmr_lpgcnt);
+		}
+
+		if (page_xresv(1, KM_SLEEP, vmmr_resv_wait) == 0) {
+			err = EINTR;
+			goto unwind;
 		}
 
 		page_t *pp;
@@ -1080,16 +1111,9 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 		    PG_EXCL | PG_NORELOC, &kseg, (void *)(vmmr_va + pos));
 
 		if (pp == NULL) {
-			/* Destroy any already-created pages */
-			if (pos != span->vs_addr) {
-				vmmr_span_t destroy_span = {
-					.vs_addr = span->vs_addr,
-					.vs_size = pos - span->vs_addr,
-				};
-
-				vmmr_destroy_pages(&destroy_span);
-			}
-			return (ENOMEM);
+			page_unresv(1);
+			err = ENOMEM;
+			goto unwind;
 		}
 
 		/* mimic page state from segkmem */
@@ -1105,6 +1129,18 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 	}
 
 	return (0);
+
+unwind:
+	/* Destroy any already-created pages */
+	if (pos != span->vs_addr) {
+		vmmr_span_t destroy_span = {
+			.vs_addr = span->vs_addr,
+			.vs_size = pos - span->vs_addr,
+		};
+
+		vmmr_destroy_pages(&destroy_span);
+	}
+	return (err);
 }
 
 static int
@@ -1173,16 +1209,14 @@ vmmr_add(size_t sz, bool transient)
 		return (ENOSPC);
 	}
 	vmmr_adding_sz += sz;
-	mutex_exit(&vmmr_lock);
 
-	/* Wait for enough pages to become available */
-	if (page_xresv(sz >> PAGESHIFT, KM_SLEEP, vmmr_resv_wait) == 0) {
-		mutex_enter(&vmmr_lock);
-		vmmr_adding_sz -= sz;
-		return (EINTR);
-	}
-
-	mutex_enter(&vmmr_lock);
+	/*
+	 * Note: availrmem is not reserved here for the request as a whole.
+	 * vmmr_alloc_pages() reserves it per-page, only for whatever portion
+	 * it actually ends up sourcing from the ordinary page pool rather
+	 * than the bootmem pool (see sys/bootmem.h), since bootmem-sourced
+	 * pages never draw on availrmem at all.
+	 */
 	size_t added = 0;
 	size_t remain = sz;
 	while (added < sz) {
@@ -1228,7 +1262,6 @@ vmmr_add(size_t sz, bool transient)
 
 			vmmr_adding_sz -= sz;
 
-			page_unresv(sz >> PAGESHIFT);
 			return (err);
 		}
 
@@ -1286,7 +1319,6 @@ vmmr_remove(size_t sz, bool transient)
 	} else {
 		vmmr_free_transient_sz -= sz;
 	}
-	page_unresv(sz >> PAGESHIFT);
 	return (0);
 }
 
