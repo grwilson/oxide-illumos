@@ -249,13 +249,26 @@ extern int bootprop_getsize(const char *, uint64_t, uint64_t *);
  * Amount of memory (bytes, with an optional k/M/G/T suffix or a '%' of
  * total installed memory) to withhold from page_t/memseg management at
  * boot -- see bootprop_getsize() and startup_memlist()'s use of
- * bootmem_pages/bootmem_before/bootmem_resv.  Read and applied as early as
+ * rawmem_pages/rawmem_before/rawmem_resv.  Read and applied as early as
  * possible in fakebop.c (alongside `physmem`'s own handling), since any
  * later point risks the early-boot physical allocator having already
  * placed something inside the reserved region.
  */
-#define	BOOTMEM_SIZE_PROP	"bootmem-size"
-extern pgcnt_t bootmem_pages;
+#define	PHYS_RAWMEM_SIZE_PROP	"phys-rawmem-size"
+extern pgcnt_t rawmem_pages;
+
+/*
+ * Regardless of what PHYS_RAWMEM_SIZE_PROP requests -- whether given as an
+ * absolute size or a '%' of total installed memory, both are reduced to a
+ * page count by bootprop_getsize() before anything else sees them -- never
+ * let the reservation consume more than this percentage of memory.  This
+ * protects the general, page_t-managed system from being starved down to
+ * (or near) zero pages by an oversized (e.g. "100%") request.  Applied both
+ * where the ceiling is first set in fakebop.c (against the coarse installed
+ * total) and again in startup_memlist() (against the precise, kernel-
+ * occupied-subtracted npages).
+ */
+#define	RAWMEM_MAX_PCT		80
 
 /*
  * Back door to fakebop.c to get physical memory allocated.

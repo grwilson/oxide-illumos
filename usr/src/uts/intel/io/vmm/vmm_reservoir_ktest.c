@@ -15,7 +15,7 @@
 
 /*
  * ktest suite for the VMM memory reservoir (see vmm_reservoir.c), with a
- * particular focus on its bootmem-tiered sourcing (see sys/bootmem.h).
+ * particular focus on its rawmem-tiered sourcing (see sys/rawmem.h).
  *
  * These tests exercise the reservoir purely through its public API
  * (vmmr_alloc()/vmmr_free()/vmmr_region_pfn_at()/vmmr_is_empty()), using
@@ -39,7 +39,7 @@
 #include <sys/ktest.h>
 #include <sys/modctl.h>
 #include <sys/sysmacros.h>
-#include <sys/bootmem.h>
+#include <sys/rawmem.h>
 #include <sys/vmm_reservoir.h>
 
 typedef int (*vmmr_alloc_fn_t)(size_t, bool, vmmr_region_t **);
@@ -119,24 +119,24 @@ cleanup:
 }
 
 /*
- * Grow the reservoir by an amount that fits within the bootmem pool's
+ * Grow the reservoir by an amount that fits within the rawmem pool's
  * current free capacity, and confirm that capacity drops by exactly that
- * amount -- proving the growth was actually sourced from bootmem, rather
+ * amount -- proving the growth was actually sourced from rawmem, rather
  * than merely succeeding via the ordinary page_t-backed paths.  Shrinking
  * the reservoir back down should then restore the original free capacity.
  */
 static void
-vmmr_ktest_bootmem_engaged(ktest_ctx_hdl_t *ctx)
+vmmr_ktest_rawmem_engaged(ktest_ctx_hdl_t *ctx)
 {
 	pgcnt_t total, free_before;
 
-	bootmem_query(&total, &free_before);
+	rawmem_query(&total, &free_before);
 	if (total == 0) {
-		KT_SKIP(ctx, "no bootmem reservation configured");
+		KT_SKIP(ctx, "no rawmem reservation configured");
 		return;
 	}
 	if (free_before == 0) {
-		KT_SKIP(ctx, "bootmem pool already fully consumed");
+		KT_SKIP(ctx, "rawmem pool already fully consumed");
 		return;
 	}
 
@@ -158,19 +158,19 @@ vmmr_ktest_bootmem_engaged(ktest_ctx_hdl_t *ctx)
 
 	KT_EASSERT0G(fns.vkf_alloc(sz, true, &region), ctx, cleanup);
 
-	/* Touch the endpoints to exercise the bootmem PFN-lookup path. */
+	/* Touch the endpoints to exercise the rawmem PFN-lookup path. */
 	(void) fns.vkf_pfn_at(region, 0);
 	(void) fns.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
 
 	pgcnt_t free_after;
-	bootmem_query(NULL, &free_after);
+	rawmem_query(NULL, &free_after);
 	KT_ASSERT3UG(free_before - free_after, ==, req_pages, ctx, cleanup_region);
 
 	fns.vkf_free(region);
 	region = NULL;
 
 	pgcnt_t free_restored;
-	bootmem_query(NULL, &free_restored);
+	rawmem_query(NULL, &free_restored);
 	KT_ASSERT3UG(free_restored, ==, free_before, ctx, cleanup);
 
 	KT_PASS(ctx);
@@ -185,26 +185,26 @@ cleanup:
 }
 
 /*
- * Grow the reservoir by a few pages more than the bootmem pool's total
+ * Grow the reservoir by a few pages more than the rawmem pool's total
  * capacity, and confirm the allocation still succeeds (the excess falling
- * through to the single-page page_create_va() fallback) while bootmem's
+ * through to the single-page page_create_va() fallback) while rawmem's
  * free capacity bottoms out at zero rather than producing an error.
  *
  * page_xresv() now reserves availrmem only for the pages actually sourced
  * from the ordinary pool (see vmmr_alloc_pages()), not the request as a
  * whole, so the excess here no longer needs to be kept to an absolute
  * minimum to avoid blocking under memory pressure -- it just needs to stay
- * smaller than a large page (see vmmr_ktest_bootmem_overflow_large below
+ * smaller than a large page (see vmmr_ktest_rawmem_overflow_large below
  * for that case) so it reliably exercises the single-page path alone.
  */
 static void
-vmmr_ktest_bootmem_overflow_small(ktest_ctx_hdl_t *ctx)
+vmmr_ktest_rawmem_overflow_small(ktest_ctx_hdl_t *ctx)
 {
 	pgcnt_t total, free_before;
 
-	bootmem_query(&total, &free_before);
+	rawmem_query(&total, &free_before);
 	if (total == 0) {
-		KT_SKIP(ctx, "no bootmem reservation configured");
+		KT_SKIP(ctx, "no rawmem reservation configured");
 		return;
 	}
 
@@ -231,7 +231,7 @@ vmmr_ktest_bootmem_overflow_small(ktest_ctx_hdl_t *ctx)
 	}
 
 	pgcnt_t free_after;
-	bootmem_query(NULL, &free_after);
+	rawmem_query(NULL, &free_after);
 	KT_ASSERT3UG(free_after, ==, 0, ctx, cleanup_region);
 
 	(void) fns.vkf_pfn_at(region, 0);
@@ -241,7 +241,7 @@ vmmr_ktest_bootmem_overflow_small(ktest_ctx_hdl_t *ctx)
 	region = NULL;
 
 	pgcnt_t free_restored;
-	bootmem_query(NULL, &free_restored);
+	rawmem_query(NULL, &free_restored);
 	KT_ASSERT3UG(free_restored, ==, free_before, ctx, cleanup);
 
 	KT_PASS(ctx);
@@ -256,10 +256,10 @@ cleanup:
 }
 
 /*
- * Grow the reservoir past bootmem's total capacity by enough to force a
+ * Grow the reservoir past rawmem's total capacity by enough to force a
  * full large-page-sized chunk through the ordinary path, exercising
  * vmmr_alloc_large()/page_xresv(vmmr_lpgcnt, ...) -- the branch
- * vmmr_ktest_bootmem_overflow_small's single-page excess never reaches.
+ * vmmr_ktest_rawmem_overflow_small's single-page excess never reaches.
  *
  * vmmr_lpgcnt is not part of vmm's exported API (nor a function), but
  * ktest_get_fn() resolves any named symbol via the module's full symbol
@@ -267,13 +267,13 @@ cleanup:
  * pointer is the address of the static variable itself.
  */
 static void
-vmmr_ktest_bootmem_overflow_large(ktest_ctx_hdl_t *ctx)
+vmmr_ktest_rawmem_overflow_large(ktest_ctx_hdl_t *ctx)
 {
 	pgcnt_t total, free_before;
 
-	bootmem_query(&total, &free_before);
+	rawmem_query(&total, &free_before);
 	if (total == 0) {
-		KT_SKIP(ctx, "no bootmem reservation configured");
+		KT_SKIP(ctx, "no rawmem reservation configured");
 		return;
 	}
 
@@ -299,10 +299,10 @@ vmmr_ktest_bootmem_overflow_large(ktest_ctx_hdl_t *ctx)
 	const pgcnt_t lpgcnt = *lpgcnt_ptr;
 
 	/*
-	 * However bootmem's own capacity happens to align, two full large
+	 * However rawmem's own capacity happens to align, two full large
 	 * pages of excess guarantees at least one large-page-aligned,
 	 * large-page-sized chunk is left over for the ordinary path once
-	 * bootmem is exhausted.
+	 * rawmem is exhausted.
 	 */
 	const pgcnt_t req_pages = total + (2 * lpgcnt);
 	const size_t sz = req_pages << PAGESHIFT;
@@ -310,7 +310,7 @@ vmmr_ktest_bootmem_overflow_large(ktest_ctx_hdl_t *ctx)
 	KT_EASSERT0G(fns.vkf_alloc(sz, true, &region), ctx, cleanup);
 
 	pgcnt_t free_after;
-	bootmem_query(NULL, &free_after);
+	rawmem_query(NULL, &free_after);
 	KT_ASSERT3UG(free_after, ==, 0, ctx, cleanup_region);
 
 	(void) fns.vkf_pfn_at(region, 0);
@@ -320,7 +320,7 @@ vmmr_ktest_bootmem_overflow_large(ktest_ctx_hdl_t *ctx)
 	region = NULL;
 
 	pgcnt_t free_restored;
-	bootmem_query(NULL, &free_restored);
+	rawmem_query(NULL, &free_restored);
 	KT_ASSERT3UG(free_restored, ==, free_before, ctx, cleanup);
 
 	KT_PASS(ctx);
@@ -355,12 +355,12 @@ _init(void)
 	VERIFY0(ktest_add_suite(km, "reservoir", &ks));
 	VERIFY0(ktest_add_test(ks, "vmmr_ktest_basic_alloc_free",
 	    vmmr_ktest_basic_alloc_free, KTEST_FLAG_NONE));
-	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_engaged",
-	    vmmr_ktest_bootmem_engaged, KTEST_FLAG_NONE));
-	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_overflow_small",
-	    vmmr_ktest_bootmem_overflow_small, KTEST_FLAG_NONE));
-	VERIFY0(ktest_add_test(ks, "vmmr_ktest_bootmem_overflow_large",
-	    vmmr_ktest_bootmem_overflow_large, KTEST_FLAG_NONE));
+	VERIFY0(ktest_add_test(ks, "vmmr_ktest_rawmem_engaged",
+	    vmmr_ktest_rawmem_engaged, KTEST_FLAG_NONE));
+	VERIFY0(ktest_add_test(ks, "vmmr_ktest_rawmem_overflow_small",
+	    vmmr_ktest_rawmem_overflow_small, KTEST_FLAG_NONE));
+	VERIFY0(ktest_add_test(ks, "vmmr_ktest_rawmem_overflow_large",
+	    vmmr_ktest_rawmem_overflow_large, KTEST_FLAG_NONE));
 
 	if ((ret = ktest_register_module(km)) != 0) {
 		ktest_free_module(km);

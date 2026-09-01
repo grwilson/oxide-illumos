@@ -14,9 +14,9 @@
  */
 
 /*
- * See sys/bootmem.h for the design.  In short: a single vmem arena over
+ * See sys/rawmem.h for the design.  In short: a single vmem arena over
  * PFN-space (quantum 1, so arena "addresses" are literally PFNs), built
- * once from phys_bootmem and never resized.
+ * once from phys_rawmem and never resized.
  */
 
 #include <sys/types.h>
@@ -26,50 +26,50 @@
 #include <sys/vmem.h>
 #include <sys/memlist.h>
 #include <sys/bootconf.h>
-#include <sys/bootmem.h>
+#include <sys/rawmem.h>
 #include <vm/page.h>
 
-static vmem_t *bootmem_arena;
-static pgcnt_t bootmem_total_pages;
+static vmem_t *rawmem_arena;
+static pgcnt_t rawmem_total_pages;
 
 void
-bootmem_init(void)
+rawmem_init(void)
 {
 	struct memlist *ml;
 
 	/*
-	 * phys_bootmem is always a valid, non-NULL pointer once
+	 * phys_rawmem is always a valid, non-NULL pointer once
 	 * perform_allocations() has run -- it's part of the unconditionally
-	 * sized valloc_base region.  When BOOTMEM_SIZE_PROP is unset (or
-	 * clamped to 0), bootmem_filter() never actually writes any entries
+	 * sized valloc_base region.  When PHYS_RAWMEM_SIZE_PROP is unset (or
+	 * clamped to 0), rawmem_filter() never actually writes any entries
 	 * into it, leaving it pointing at raw, zeroed memory (ml_address ==
-	 * 0, ml_size == 0).  bootmem_pages -- not phys_bootmem's pointer
+	 * 0, ml_size == 0).  rawmem_pages -- not phys_rawmem's pointer
 	 * value -- is the real signal for "was anything reserved".
 	 */
-	if (bootmem_pages == 0)
+	if (rawmem_pages == 0)
 		return;
 
-	bootmem_arena = vmem_create("bootmem", NULL, 0, 1,
+	rawmem_arena = vmem_create("rawmem", NULL, 0, 1,
 	    NULL, NULL, NULL, 0, VM_SLEEP);
 
-	for (ml = phys_bootmem; ml != NULL; ml = ml->ml_next) {
+	for (ml = phys_rawmem; ml != NULL; ml = ml->ml_next) {
 		pgcnt_t pages = btop(ml->ml_size);
 
-		(void) vmem_add(bootmem_arena,
+		(void) vmem_add(rawmem_arena,
 		    (void *)(uintptr_t)btop(ml->ml_address), pages, VM_SLEEP);
-		bootmem_total_pages += pages;
+		rawmem_total_pages += pages;
 	}
 }
 
 int
-bootmem_alloc(pgcnt_t npages, uint_t align_pages, int vmflag, pfn_t *pfnp)
+rawmem_alloc(pgcnt_t npages, uint_t align_pages, int vmflag, pfn_t *pfnp)
 {
 	void *res;
 
-	if (bootmem_arena == NULL)
+	if (rawmem_arena == NULL)
 		return (ENXIO);
 
-	res = vmem_xalloc(bootmem_arena, npages, MAX(align_pages, 1), 0, 0,
+	res = vmem_xalloc(rawmem_arena, npages, MAX(align_pages, 1), 0, 0,
 	    NULL, NULL, vmflag);
 	if (res == NULL)
 		return (ENOMEM);
@@ -79,17 +79,17 @@ bootmem_alloc(pgcnt_t npages, uint_t align_pages, int vmflag, pfn_t *pfnp)
 }
 
 void
-bootmem_free(pfn_t pfn, pgcnt_t npages)
+rawmem_free(pfn_t pfn, pgcnt_t npages)
 {
-	vmem_xfree(bootmem_arena, (void *)(uintptr_t)pfn, npages);
+	vmem_xfree(rawmem_arena, (void *)(uintptr_t)pfn, npages);
 }
 
 void
-bootmem_query(pgcnt_t *totalp, pgcnt_t *freep)
+rawmem_query(pgcnt_t *totalp, pgcnt_t *freep)
 {
 	if (totalp != NULL)
-		*totalp = bootmem_arena != NULL ? bootmem_total_pages : 0;
+		*totalp = rawmem_arena != NULL ? rawmem_total_pages : 0;
 	if (freep != NULL)
-		*freep = bootmem_arena != NULL ?
-		    vmem_size(bootmem_arena, VMEM_FREE) : 0;
+		*freep = rawmem_arena != NULL ?
+		    vmem_size(rawmem_arena, VMEM_FREE) : 0;
 }

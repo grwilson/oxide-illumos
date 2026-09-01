@@ -112,13 +112,14 @@ static paddr_t high_phys = -(paddr_t)1;	/* last used physical address */
 
 /*
  * Upper bound (in pages) on what do_bop_phys_alloc() may hand out, imposed
- * by the bootmem reservation computed in startup_memlist() -- see
- * bop_set_bootmem_ceiling().  0 means no additional limit is in effect.
- * Kept independent of `physmem` deliberately: conflating this with an
- * operator's own physmem= setting (and its accompanying orig_npages
- * warning) would make both harder to reason about and report accurately.
+ * by the rawmem reservation computed in read_bootenvrc() -- see
+ * bop_set_rawmem_ceiling().  rawmem_ceiling_pages is only meaningful when
+ * rawmem_ceiling_active is set; a ceiling of 0 pages (the whole range
+ * withheld) is a legitimate value in its own right and must not be
+ * confused with "no ceiling configured".
  */
-static pgcnt_t bootmem_ceiling_pages = 0;
+static pgcnt_t rawmem_ceiling_pages = 0;
+static boolean_t rawmem_ceiling_active = B_FALSE;
 
 /*
  * buffer for vsnprintf for console I/O
@@ -225,14 +226,13 @@ do_bop_phys_alloc(uint64_t size, uint64_t align)
 		high_phys = pfn_to_pa(physmem);
 
 	/*
-	 * Likewise for the bootmem reservation, if one has been set up by
-	 * startup_memlist() -- keeps this allocator (and anything it backs,
-	 * e.g. perform_allocations()'s valloc_base region) out of the memory
-	 * withheld for page_t-less use.
+	 * Likewise for the rawmem reservation, if one has been set by
+	 * read_bootenvrc() (via bop_set_rawmem_ceiling()) -- keeps this
+	 * allocator out of the memory reserved for page_t-less use.
 	 */
-	if (bootmem_ceiling_pages != 0 &&
-	    high_phys > pfn_to_pa(bootmem_ceiling_pages))
-		high_phys = pfn_to_pa(bootmem_ceiling_pages);
+	if (rawmem_ceiling_active &&
+	    high_phys > pfn_to_pa(rawmem_ceiling_pages))
+		high_phys = pfn_to_pa(rawmem_ceiling_pages);
 
 	/*
 	 * find the highest available memory in physinstalled
@@ -276,17 +276,14 @@ do_bop_phys_alloc(uint64_t size, uint64_t align)
 }
 
 /*
- * Called by startup_memlist() once it has computed how many pages are to
- * be withheld from page_t/memseg management for the bootmem reservation
- * (BOOTMEM_SIZE_PROP), before perform_allocations() runs.  This keeps
- * do_bop_phys_alloc() -- and anything it backs -- out of that reserved
- * region, without touching `physmem` or its own reconciliation/warning
- * semantics.
+ * Called by read_bootenvrc() once it has computed how many pages are to
+ * be withheld from page_t/memseg for the rawmem reservation.
  */
 void
-bop_set_bootmem_ceiling(pgcnt_t pages)
+bop_set_rawmem_ceiling(pgcnt_t pages)
 {
-	bootmem_ceiling_pages = pages;
+	rawmem_ceiling_pages = pages;
+	rawmem_ceiling_active = B_TRUE;
 }
 
 uintptr_t
@@ -708,8 +705,8 @@ boot_prop_display(char *buffer)
 
 /*
  * Coarse total installed page count, summed directly from the raw boot
- * memlist.  Used only as the percentage reference for BOOTMEM_SIZE_PROP
- * (see bop_set_bootmem_ceiling() below) -- deliberately not the more
+ * memlist.  Used only as the percentage reference for PHYS_RAWMEM_SIZE_PROP
+ * (see bop_set_rawmem_ceiling() below) -- deliberately not the more
  * precise, kernel-occupied-subtracted npages startup_memlist() computes
  * later, since that isn't known this early.
  */
@@ -874,32 +871,33 @@ done:
 	}
 
 	/*
-	 * Read BOOTMEM_SIZE_PROP and, if set, keep do_bop_phys_alloc() out of
-	 * the top bootmem_pages of memory from this point on -- before
+	 * Read PHYS_RAWMEM_SIZE_PROP and, if set, keep do_bop_phys_alloc()
+	 * out of the top rawmem_pages of memory from this point on -- before
 	 * early_allocation is cleared below and everything that follows
-	 * (bootenvrc property storage, ACPI table copies, _kobj_boot()'s
-	 * module loading, and eventually startup_memlist()'s own
-	 * perform_allocations()) starts competing for the highest available
-	 * addresses.  bootmem_pages itself is consumed again, unchanged,
-	 * by startup_memlist() to build phys_avail/phys_bootmem once the
-	 * precise (kernel-occupied-subtracted) page count is known; this
-	 * uses only a coarse total (total_installed_pages()) for any '%'
-	 * reference, since that precise count isn't available yet.
+	 * starts competing for the highest available addresses.  rawmem_pages
+	 * itself is consumed again, unchanged, by startup_memlist() to build
+	 * phys_avail/phys_rawmem once the precise (kernel-occupied-subtracted)
+	 * page count is known; this uses only a coarse total
+	 * (total_installed_pages()) for any '%' reference, since that precise
+	 * count isn't available yet.  Never let the request (however it was
+	 * expressed) consume more than RAWMEM_MAX_PCT of memory -- see
+	 * sys/bootconf.h -- which also ensures rawmem_pages can never reach
+	 * total_pages, so the ceiling below can never legitimately be 0.
 	 */
-	uint64_t bootmem_bytes;
+	uint64_t rawmem_bytes;
+	pgcnt_t total_pages = total_installed_pages();
 
-	if (bootprop_getsize(BOOTMEM_SIZE_PROP, ptob(total_installed_pages()),
-	    &bootmem_bytes) == 0)
-		bootmem_pages = btop(bootmem_bytes);
-	else
-		bootmem_pages = 0;
+	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP,
+	    ptob(total_pages), &rawmem_bytes) == 0) {
+		rawmem_pages = btop(rawmem_bytes);
 
-	if (bootmem_pages > 0) {
-		pgcnt_t total = total_installed_pages();
+		pgcnt_t rawmem_max = (total_pages * RAWMEM_MAX_PCT) / 100;
 
-		if (bootmem_pages > total)
-			bootmem_pages = total;
-		bop_set_bootmem_ceiling(total - bootmem_pages);
+		if (rawmem_pages > rawmem_max)
+			rawmem_pages = rawmem_max;
+		bop_set_rawmem_ceiling(total_pages - rawmem_pages);
+	} else {
+		rawmem_pages = 0;
 	}
 
 	early_allocation = 0;

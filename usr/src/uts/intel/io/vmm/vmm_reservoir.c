@@ -97,19 +97,19 @@
  * released.
  *
  *
- * Bootmem-Backed Pages
+ * Rawmem-Backed Pages
  *
- * When a bootmem reservation (see sys/bootmem.h) was configured at boot,
+ * When a rawmem reservation (see sys/rawmem.h) was configured at boot,
  * the reservoir will try sourcing pages from it before falling back to
  * page_create_va_large()/page_create_va().  Pages sourced this way have no
  * page_t or vnode identity at all -- they were carved out of physical
  * memory before page_t construction ran -- so they cannot be located via
  * page_find().  Instead, each contiguous chunk obtained from
- * bootmem_alloc() is tracked in vmmr_bootmem_tree, keyed by its
+ * rawmem_alloc() is tracked in vmmr_rawmem_tree, keyed by its
  * reservoir-VA-relative offset, the same way large-page groups are tracked
  * in vmmr_lpg_tree: constituent PAGESIZE pages are released individually
  * via a bitmap, and the chunk as a whole is only returned via
- * bootmem_free() once every constituent has been released. Since bootmem's
+ * rawmem_free() once every constituent has been released. Since rawmem's
  * capacity is fixed for the life of the boot and typically much smaller
  * than the reservoir's eventual size, this is purely an opportunistic first
  * tier -- any portion of a request it cannot satisfy falls through to the
@@ -134,7 +134,7 @@
 #include <vm/seg_kmem.h>
 #include <vm/hat_i86.h>
 #include <sys/kstat.h>
-#include <sys/bootmem.h>
+#include <sys/rawmem.h>
 
 #include <sys/vmm_reservoir.h>
 #include <sys/vmm_dev.h>
@@ -197,7 +197,7 @@ typedef struct vmmr_lpg {
 } vmmr_lpg_t;
 
 /*
- * Tracking structure for a single bootmem-sourced chunk (see sys/bootmem.h)
+ * Tracking structure for a single rawmem-sourced chunk (see sys/rawmem.h)
  * used to back part of the reservoir.  These pages have no page_t/vnode
  * identity at all, so unlike the ordinary reservoir pages, they cannot be
  * found via page_find(); this side table is how vmmr_region_pfn_at() and
@@ -205,30 +205,30 @@ typedef struct vmmr_lpg {
  *
  * The shape mirrors vmmr_lpg_t: `vb_base` is the reservoir-VA-relative
  * offset of the first constituent page, `vb_pfn` is the base PFN returned
- * by bootmem_alloc(), and `vb_freemap`/`vb_nfree` track individual release
+ * by rawmem_alloc(), and `vb_freemap`/`vb_nfree` track individual release
  * of the `vb_pages` constituent PAGESIZE pages.  Once every constituent has
- * been released, the whole chunk is returned via bootmem_free().  Unlike
- * large-page groups, a bootmem chunk is not necessarily vmmr_lpgsz-sized or
+ * been released, the whole chunk is returned via rawmem_free().  Unlike
+ * large-page groups, a rawmem chunk is not necessarily vmmr_lpgsz-sized or
  * aligned -- it can be as small as a single page -- so lookups walk
- * vmmr_bootmem_tree via avl_find()/avl_nearest() rather than masking the
+ * vmmr_rawmem_tree via avl_find()/avl_nearest() rather than masking the
  * position against a fixed chunk size.
  */
-typedef struct vmmr_bootmem_chunk {
+typedef struct vmmr_rawmem_chunk {
 	avl_node_t	vb_node;
 	uintptr_t	vb_base;
 	pfn_t		vb_pfn;
 	pgcnt_t		vb_pages;
 	pgcnt_t		vb_nfree;
 	ulong_t		*vb_freemap;
-} vmmr_bootmem_chunk_t;
+} vmmr_rawmem_chunk_t;
 
 /*
- * Protects vmmr_lpg_tree and vmmr_bootmem_tree only; never held across
- * page_create/destroy or bootmem_alloc/free calls.
+ * Protects vmmr_lpg_tree and vmmr_rawmem_tree only; never held across
+ * page_create/destroy or rawmem_alloc/free calls.
  */
 static kmutex_t vmmr_lpg_lock;
 static avl_tree_t vmmr_lpg_tree;
-static avl_tree_t vmmr_bootmem_tree;
+static avl_tree_t vmmr_rawmem_tree;
 
 /* Pair of AVL trees to store set of spans ordered by addr and size */
 typedef struct vmmr_treepair {
@@ -271,7 +271,7 @@ typedef struct vmmr_kstats {
 
 static int vmmr_add(size_t, bool);
 static int vmmr_remove(size_t, bool);
-static vmmr_bootmem_chunk_t *vmmr_bootmem_find(uintptr_t);
+static vmmr_rawmem_chunk_t *vmmr_rawmem_find(uintptr_t);
 static int vmmr_resv_wait();
 
 static int
@@ -340,10 +340,10 @@ vmmr_cmp_lpg_base(const void *a, const void *b)
 }
 
 static int
-vmmr_cmp_bootmem_base(const void *a, const void *b)
+vmmr_cmp_rawmem_base(const void *a, const void *b)
 {
-	const vmmr_bootmem_chunk_t *ca = a;
-	const vmmr_bootmem_chunk_t *cb = b;
+	const vmmr_rawmem_chunk_t *ca = a;
+	const vmmr_rawmem_chunk_t *cb = b;
 
 	if (ca->vb_base == cb->vb_base) {
 		return (0);
@@ -527,16 +527,16 @@ vmmr_init()
 	 * The value is based off of pages_pp_maximum: "Number of currently
 	 * available pages that cannot be 'locked'".  It is sized as all of
 	 * `physmem` less 120% of `pages_pp_maximum`, plus the full capacity
-	 * of the bootmem pool (see sys/bootmem.h), whose pages are carved out
+	 * of the rawmem pool (see sys/rawmem.h), whose pages are carved out
 	 * of `physmem` at boot and so are not already reflected in it.
 	 */
-	pgcnt_t bootmem_cap;
+	pgcnt_t rawmem_cap;
 
-	bootmem_query(&bootmem_cap, NULL);
+	rawmem_query(&rawmem_cap, NULL);
 
 	vmmr_total_limit =
 	    (((physmem * 10)  - (pages_pp_maximum * 12)) * PAGESIZE) / 10 +
-	    (bootmem_cap * PAGESIZE);
+	    (rawmem_cap * PAGESIZE);
 
 	vmmr_empty_last = 0;
 	vmmr_free_sz = 0;
@@ -594,8 +594,8 @@ vmmr_init()
 	vmmr_tp_init(&vmmr_empty_tp);
 	avl_create(&vmmr_lpg_tree, vmmr_cmp_lpg_base, sizeof (vmmr_lpg_t),
 	    offsetof(vmmr_lpg_t, vl_node));
-	avl_create(&vmmr_bootmem_tree, vmmr_cmp_bootmem_base,
-	    sizeof (vmmr_bootmem_chunk_t), offsetof(vmmr_bootmem_chunk_t,
+	avl_create(&vmmr_rawmem_tree, vmmr_cmp_rawmem_base,
+	    sizeof (vmmr_rawmem_chunk_t), offsetof(vmmr_rawmem_chunk_t,
 	    vb_node));
 
 	list_create(&vmmr_alloc_regions, sizeof (vmmr_region_t),
@@ -603,11 +603,11 @@ vmmr_init()
 
 	/*
 	 * Grab a chunk of VA for the reservoir.  It is aligned to the large
-	 * page size when large page support is enabled.  Since bootmem pages
+	 * page size when large page support is enabled.  Since rawmem pages
 	 * are additional capacity not already counted in `physmem`, the VA
 	 * range must be sized to cover both sources.
 	 */
-	vmmr_va_sz = (physmem + bootmem_cap) * PAGESIZE;
+	vmmr_va_sz = (physmem + rawmem_cap) * PAGESIZE;
 	vmmr_va = (uintptr_t)vmem_xalloc(kvmm_arena, vmmr_va_sz,
 	    MAX(vmmr_lpgsz, PAGESIZE), 0, 0, NULL, NULL, VM_SLEEP);
 
@@ -632,8 +632,8 @@ vmmr_fini()
 	mutex_enter(&vmmr_lpg_lock);
 	VERIFY(avl_is_empty(&vmmr_lpg_tree));
 	avl_destroy(&vmmr_lpg_tree);
-	VERIFY(avl_is_empty(&vmmr_bootmem_tree));
-	avl_destroy(&vmmr_bootmem_tree);
+	VERIFY(avl_is_empty(&vmmr_rawmem_tree));
+	avl_destroy(&vmmr_rawmem_tree);
 	mutex_exit(&vmmr_lpg_lock);
 
 	kstat_delete(vmmr_kstat);
@@ -753,7 +753,7 @@ vmmr_region_pfn_at(vmmr_region_t *region, uintptr_t off)
 	uintptr_t span_off = off - span->vs_region_addr + span->vs_addr;
 
 	mutex_enter(&vmmr_lpg_lock);
-	vmmr_bootmem_chunk_t *chunk = vmmr_bootmem_find(span_off);
+	vmmr_rawmem_chunk_t *chunk = vmmr_rawmem_find(span_off);
 	if (chunk != NULL) {
 		pfn_t pfn = chunk->vb_pfn +
 		    ((span_off - chunk->vb_base) >> PAGESHIFT);
@@ -849,23 +849,23 @@ vmmr_release_from_group(uintptr_t pos)
 }
 
 /*
- * Find the bootmem chunk (see sys/bootmem.h), if any, covering
+ * Find the rawmem chunk (see sys/rawmem.h), if any, covering
  * reservoir-VA-relative offset `pos`.  Returns NULL when `pos` is backed by
  * the ordinary page_t/vnode path instead.  Must be called with
  * vmmr_lpg_lock held.
  */
-static vmmr_bootmem_chunk_t *
-vmmr_bootmem_find(uintptr_t pos)
+static vmmr_rawmem_chunk_t *
+vmmr_rawmem_find(uintptr_t pos)
 {
 	ASSERT(MUTEX_HELD(&vmmr_lpg_lock));
 
-	vmmr_bootmem_chunk_t search = { .vb_base = pos };
-	vmmr_bootmem_chunk_t *chunk;
+	vmmr_rawmem_chunk_t search = { .vb_base = pos };
+	vmmr_rawmem_chunk_t *chunk;
 	avl_index_t where;
 
-	chunk = avl_find(&vmmr_bootmem_tree, &search, &where);
+	chunk = avl_find(&vmmr_rawmem_tree, &search, &where);
 	if (chunk == NULL) {
-		chunk = avl_nearest(&vmmr_bootmem_tree, where, AVL_BEFORE);
+		chunk = avl_nearest(&vmmr_rawmem_tree, where, AVL_BEFORE);
 	}
 	if (chunk != NULL && (pos < chunk->vb_base ||
 	    pos >= chunk->vb_base + (chunk->vb_pages << PAGESHIFT))) {
@@ -883,7 +883,7 @@ vmmr_destroy_pages(vmmr_span_t *span)
 		page_t *pp;
 
 		mutex_enter(&vmmr_lpg_lock);
-		vmmr_bootmem_chunk_t *chunk = vmmr_bootmem_find(pos);
+		vmmr_rawmem_chunk_t *chunk = vmmr_rawmem_find(pos);
 		if (chunk != NULL) {
 			const pgcnt_t idx = (pos - chunk->vb_base) >>
 			    PAGESHIFT;
@@ -894,12 +894,12 @@ vmmr_destroy_pages(vmmr_span_t *span)
 
 			const bool done = (chunk->vb_nfree == chunk->vb_pages);
 			if (done) {
-				avl_remove(&vmmr_bootmem_tree, chunk);
+				avl_remove(&vmmr_rawmem_tree, chunk);
 			}
 			mutex_exit(&vmmr_lpg_lock);
 
 			if (done) {
-				bootmem_free(chunk->vb_pfn, chunk->vb_pages);
+				rawmem_free(chunk->vb_pfn, chunk->vb_pages);
 				kmem_free(chunk->vb_freemap,
 				    BT_SIZEOFMAP(chunk->vb_pages));
 				kmem_free(chunk, sizeof (*chunk));
@@ -1013,22 +1013,22 @@ vmmr_alloc_large(struct vnode *vp, struct seg *kseg, uintptr_t pos)
 
 /*
  * Attempt to source `npages` PAGESIZE pages, aligned to `npages` pages, from
- * the bootmem pool (see sys/bootmem.h) to back the reservoir VA range
- * beginning at `pos`, tracking the result in vmmr_bootmem_tree.  Upon
- * failure (bootmem exhausted, or unconfigured), the caller falls back to
+ * the rawmem pool (see sys/rawmem.h) to back the reservoir VA range
+ * beginning at `pos`, tracking the result in vmmr_rawmem_tree.  Upon
+ * failure (rawmem exhausted, or unconfigured), the caller falls back to
  * the ordinary page_t-backed allocation paths.
  */
 static int
-vmmr_alloc_bootmem_chunk(uintptr_t pos, pgcnt_t npages)
+vmmr_alloc_rawmem_chunk(uintptr_t pos, pgcnt_t npages)
 {
 	pfn_t pfn;
 
-	if (bootmem_alloc(npages, npages, VM_NOSLEEP, &pfn) != 0) {
+	if (rawmem_alloc(npages, npages, VM_NOSLEEP, &pfn) != 0) {
 		return (ENOMEM);
 	}
 
-	vmmr_bootmem_chunk_t *chunk =
-	    kmem_zalloc(sizeof (vmmr_bootmem_chunk_t), KM_SLEEP);
+	vmmr_rawmem_chunk_t *chunk =
+	    kmem_zalloc(sizeof (vmmr_rawmem_chunk_t), KM_SLEEP);
 	chunk->vb_base = pos;
 	chunk->vb_pfn = pfn;
 	chunk->vb_pages = npages;
@@ -1040,7 +1040,7 @@ vmmr_alloc_bootmem_chunk(uintptr_t pos, pgcnt_t npages)
 	}
 
 	mutex_enter(&vmmr_lpg_lock);
-	avl_add(&vmmr_bootmem_tree, chunk);
+	avl_add(&vmmr_rawmem_tree, chunk);
 	mutex_exit(&vmmr_lpg_lock);
 
 	return (0);
@@ -1066,25 +1066,25 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 		    P2PHASE(vmmr_va + pos, vmmr_lpgsz) == 0;
 
 		if (lpg_aligned &&
-		    vmmr_alloc_bootmem_chunk(pos, vmmr_lpgcnt) == 0) {
+		    vmmr_alloc_rawmem_chunk(pos, vmmr_lpgcnt) == 0) {
 			pos += vmmr_lpgsz;
 			continue;
 		}
 
-		if (vmmr_alloc_bootmem_chunk(pos, 1) == 0) {
+		if (vmmr_alloc_rawmem_chunk(pos, 1) == 0) {
 			pos += PAGESIZE;
 			continue;
 		}
 
 		/*
-		 * Neither bootmem attempt succeeded (exhausted, or never
+		 * Neither rawmem attempt succeeded (exhausted, or never
 		 * configured), so this page must come from the ordinary
-		 * page_t-backed paths.  Unlike bootmem, those draw from the
+		 * page_t-backed paths.  Unlike rawmem, those draw from the
 		 * general system page pool, so availrmem must be reserved
 		 * via page_xresv() for exactly the pages sourced this way,
 		 * immediately before sourcing them -- reserving any more
 		 * (e.g. up front for the whole request, regardless of how
-		 * much of it bootmem could cover) would block unnecessarily
+		 * much of it rawmem could cover) would block unnecessarily
 		 * under memory pressure.
 		 */
 		if (lpg_aligned) {
@@ -1214,7 +1214,7 @@ vmmr_add(size_t sz, bool transient)
 	 * Note: availrmem is not reserved here for the request as a whole.
 	 * vmmr_alloc_pages() reserves it per-page, only for whatever portion
 	 * it actually ends up sourcing from the ordinary page pool rather
-	 * than the bootmem pool (see sys/bootmem.h), since bootmem-sourced
+	 * than the rawmem pool (see sys/rawmem.h), since rawmem-sourced
 	 * pages never draw on availrmem at all.
 	 */
 	size_t added = 0;
@@ -1422,10 +1422,10 @@ vmmr_ioctl(int cmd, intptr_t arg, int md, cred_t *cr, int *rvalp)
 		res.vrq_limit = vmmr_total_limit;
 		mutex_exit(&vmmr_lock);
 
-		pgcnt_t bootmem_total, bootmem_free;
-		bootmem_query(&bootmem_total, &bootmem_free);
-		res.vrq_bootmem_total_sz = bootmem_total << PAGESHIFT;
-		res.vrq_bootmem_free_sz = bootmem_free << PAGESHIFT;
+		pgcnt_t rawmem_total, rawmem_free;
+		rawmem_query(&rawmem_total, &rawmem_free);
+		res.vrq_rawmem_total_sz = rawmem_total << PAGESHIFT;
+		res.vrq_rawmem_free_sz = rawmem_free << PAGESHIFT;
 		if (ddi_copyout(&res, datap, sizeof (res), md) != 0) {
 			return (EFAULT);
 		}

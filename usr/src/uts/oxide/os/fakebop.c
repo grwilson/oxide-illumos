@@ -679,7 +679,7 @@ wait_for_psp(void)
 
 /*
  * Coarse total installed page count, summed directly from the raw boot
- * memlist.  Used only as the percentage reference for BOOTMEM_SIZE_PROP --
+ * memlist.  Used only as the percentage reference for PHYS_RAWMEM_SIZE_PROP --
  * deliberately not the more precise, kernel-occupied-subtracted npages
  * startup_memlist() computes later, since that isn't known this early.
  */
@@ -756,7 +756,7 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	}
 
 	/*
-	 * Read BOOTMEM_SIZE_PROP and, if set, withhold the top bootmem_pages
+	 * Read PHYS_RAWMEM_SIZE_PROP and, if set, withhold the top rawmem_pages
 	 * of memory from the early-boot allocator (eb_phys_alloc(), via
 	 * eb_alloc()) from this point on -- before _kobj_boot() loads kernel
 	 * modules and before startup_memlist()'s own perform_allocations()
@@ -766,25 +766,28 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	 * hole-unaware "top of the installed range" is used here rather
 	 * than a precise walk: EBPR_NO_ALLOC is harmless to apply to bytes
 	 * that were never actually installed, so this is safe, if slightly
-	 * conservative.  bootmem_pages itself is consumed again, unchanged,
-	 * by startup_memlist() to build phys_avail/phys_bootmem precisely
+	 * conservative.  rawmem_pages itself is consumed again, unchanged,
+	 * by startup_memlist() to build phys_avail/phys_rawmem precisely
 	 * once the real (kernel-occupied-subtracted) page count is known.
+	 * Never let the request (however it was expressed) consume more
+	 * than RAWMEM_MAX_PCT of memory -- see sys/bootconf.h.
 	 */
-	uint64_t bootmem_bytes;
+	uint64_t rawmem_bytes;
 
-	if (bootprop_getsize(BOOTMEM_SIZE_PROP, ptob(total_installed_pages()),
-	    &bootmem_bytes) == 0)
-		bootmem_pages = btop(bootmem_bytes);
+	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP, ptob(total_installed_pages()),
+	    &rawmem_bytes) == 0)
+		rawmem_pages = btop(rawmem_bytes);
 	else
-		bootmem_pages = 0;
+		rawmem_pages = 0;
 
-	if (bootmem_pages > 0) {
+	if (rawmem_pages > 0) {
 		pgcnt_t total = total_installed_pages();
+		pgcnt_t rawmem_max = (total * RAWMEM_MAX_PCT) / 100;
 		struct memlist *ml;
 		uint64_t top = 0;
 
-		if (bootmem_pages > total)
-			bootmem_pages = total;
+		if (rawmem_pages > rawmem_max)
+			rawmem_pages = rawmem_max;
 
 		for (ml = bm.physinstalled; ml != NULL; ml = ml->ml_next) {
 			uint64_t end = ml->ml_address + ml->ml_size;
@@ -792,8 +795,8 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 				top = end;
 		}
 
-		eb_physmem_reserve_range(top - ptob(bootmem_pages),
-		    ptob(bootmem_pages), EBPR_NO_ALLOC);
+		eb_physmem_reserve_range(top - ptob(rawmem_pages),
+		    ptob(rawmem_pages), EBPR_NO_ALLOC);
 	}
 
 	/*
