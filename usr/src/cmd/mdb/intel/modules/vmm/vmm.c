@@ -43,6 +43,13 @@ typedef struct mdb_vmm_softc {
 	uint_t vmm_flags;
 } mdb_vmm_softc_t;
 
+typedef struct mdb_vmmr_rawmem_chunk {
+	uintptr_t	vb_base;
+	pfn_t		vb_pfn;
+	pgcnt_t		vb_pages;
+	pgcnt_t		vb_nfree;
+} mdb_vmmr_rawmem_chunk_t;
+
 static uintptr_t mdb_zone0;
 
 static int
@@ -124,6 +131,71 @@ vmm_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 	return (DCMD_OK);
 }
 
+/* ARGSUSED */
+static int
+vmmr_rawmem_cb(uintptr_t addr, const void *unknown, void *arg)
+{
+	mdb_vmmr_rawmem_chunk_t chunk;
+
+	if (mdb_ctf_vread(&chunk, "vmmr_rawmem_chunk_t",
+	    "mdb_vmmr_rawmem_chunk_t", addr, 0) == -1) {
+		mdb_warn("can't read vmmr_rawmem_chunk_t at %p", addr);
+		return (WALK_ERR);
+	}
+
+	mdb_printf("%0?p %0?p %9lx %8lu %8lu\n", addr, chunk.vb_base,
+	    chunk.vb_pfn, chunk.vb_pages, chunk.vb_pages - chunk.vb_nfree);
+
+	return (WALK_NEXT);
+}
+
+/* ARGSUSED */
+static int
+vmmr_rawmem_dcmd(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
+{
+	GElf_Sym sym;
+
+	if ((flags & DCMD_ADDRSPEC) || argc != 0)
+		return (DCMD_USAGE);
+
+	if (mdb_lookup_by_name("vmmr_rawmem_tree", &sym) == -1) {
+		mdb_warn("failed to find 'vmmr_rawmem_tree'");
+		return (DCMD_ERR);
+	}
+
+	mdb_printf("%<u>%?s %?s %9s %8s %8s%</u>\n",
+	    "CHUNK", "VA-OFFSET", "PFN", "PAGES", "INUSE");
+
+	if (mdb_pwalk("avl", vmmr_rawmem_cb, NULL,
+	    (uintptr_t)sym.st_value) != 0) {
+		mdb_warn("can't walk vmmr_rawmem_tree");
+		return (DCMD_ERR);
+	}
+
+	return (DCMD_OK);
+}
+
+static void
+vmmr_rawmem_help(void)
+{
+	mdb_printf("%s",
+	    "Prints the chunks of rawmem-sourced memory (see sys/rawmem.h) "
+	    "currently backing the VMM reservoir, tracked in "
+	    "vmmr_rawmem_tree.\n\n");
+	mdb_printf("%s",
+	    "CHUNK\t\tAddress of the vmmr_rawmem_chunk_t\n"
+	    "VA-OFFSET\tReservoir-VA-relative offset of the chunk\n"
+	    "PFN\t\tBase PFN returned by rawmem_alloc() for this chunk\n"
+	    "PAGES\t\tSize of the chunk, in PAGESIZE pages\n"
+	    "INUSE\t\tConstituent pages not yet released back to the "
+	    "chunk\n");
+	mdb_printf("\n%s",
+	    "A chunk is returned to rawmem_free() (and drops out of this "
+	    "list) once INUSE reaches 0.  This tracking exists because "
+	    "rawmem-sourced pages have no page_t/vnode identity and so "
+	    "cannot be located via page_find().\n");
+}
+
 static int
 vmm_walk_init(mdb_walk_state_t *wsp)
 {
@@ -188,6 +260,9 @@ vmm_help(void)
 static const mdb_dcmd_t dcmds[] = {
 	{ "vmm", "?[-n vmname]",
 	    "print virtual machine information", vmm_dcmd, vmm_help },
+	{ "vmmr_rawmem", NULL,
+	    "print rawmem chunks backing the VMM reservoir", vmmr_rawmem_dcmd,
+	    vmmr_rawmem_help },
 	{ NULL }
 };
 

@@ -502,7 +502,7 @@ memstat_callback(page_t *page, page_t *pp, memstat_t *stats)
 int
 memstat(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 {
-	pgcnt_t total_pages, physmem;
+	pgcnt_t total_pages, physmem, rawmem_pages;
 	ulong_t freemem;
 	memstat_t stats;
 	GElf_Sym sym;
@@ -543,6 +543,14 @@ memstat(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		mdb_warn("unable to read physmem");
 		return (DCMD_ERR);
 	}
+
+	/*
+	 * Pages withheld from page_t/memseg management. Reported below
+	 * so this memory doesn't appear to have vanished relative to what's
+	 * physically installed.
+	 */
+	if (mdb_readvar(&rawmem_pages, "rawmem_pages") == -1)
+		rawmem_pages = 0;
 
 	/* read kernel vnode array pointer */
 	if (mdb_lookup_by_obj(MDB_OBJ_EXEC, "kvps",
@@ -662,6 +670,12 @@ memstat(uintptr_t addr, uint_t flags, int argc, const mdb_arg_t *argv)
 		mdb_printf("Physical         %16lu  %16lu\n",
 		    total_pages,
 		    (uint64_t)total_pages * PAGESIZE / (1024 * 1024));
+	}
+
+	if (rawmem_pages != 0) {
+		mdb_printf("Rawmem           %16lu  %16lu\n",
+		    rawmem_pages,
+		    (uint64_t)rawmem_pages * PAGESIZE / (1024 * 1024));
 	}
 
 #undef MS_PCT_TOTAL

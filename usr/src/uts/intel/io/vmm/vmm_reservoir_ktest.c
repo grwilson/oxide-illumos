@@ -14,8 +14,8 @@
  */
 
 /*
- * ktest suite for the VMM memory reservoir (see vmm_reservoir.c), with a
- * particular focus on its rawmem-tiered sourcing (see sys/rawmem.h).
+ * ktest suite for the VMM memory reservoir, with a particular focus on
+ * its rawmem-tiered sourcing.
  *
  * These tests exercise the reservoir purely through its public API
  * (vmmr_alloc()/vmmr_free()/vmmr_region_pfn_at()/vmmr_is_empty()), using
@@ -24,16 +24,7 @@
  * That API is fully usable the moment the vmm module is loaded -- unlike
  * the vmmctl device node, it does not require HMA/VT-x/AMD-V support or a
  * successful driver attach, which makes it usable for testing on systems
- * (e.g. nested VMs without exposed hardware virtualization) where
- * /dev/vmmctl is never created.
- *
- * None of vmmr_alloc()/vmmr_free()/vmmr_region_pfn_at()/vmmr_is_empty() are
- * exported by vmm.mapfile (they are only reachable from within the vmm
- * module itself), so they cannot be resolved via an ordinary -N drv/vmm
- * link-time dependency.  Instead, each test resolves them at run time via
- * ktest_hold_mod()/ktest_get_fn(), which -- per their documentation -- can
- * reach a module's non-exported functions directly, the same technique
- * mac_ktest.c uses for mac's internals.
+ * where /dev/vmmctl is never created.
  */
 
 #include <sys/ktest.h>

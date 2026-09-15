@@ -275,6 +275,8 @@ typedef struct vmmr_kstats {
 	kstat_named_t	vmrks_bytes_alloc;
 	kstat_named_t	vmrks_bytes_transient;
 	kstat_named_t	vmrks_bytes_limit;
+	kstat_named_t	vmrks_rawmem_bytes_free;
+	kstat_named_t	vmrks_rawmem_bytes_alloc;
 } vmmr_kstats_t;
 
 
@@ -499,6 +501,7 @@ static int
 vmmr_kstat_update(struct kstat *ksp, int rw)
 {
 	vmmr_kstats_t *vkp = ksp->ks_data;
+	pgcnt_t rawmem_total, rawmem_free;
 
 	mutex_enter(&vmmr_lock);
 	vkp->vmrks_bytes_free.value.ui64 = vmmr_free_sz;
@@ -512,6 +515,17 @@ vmmr_kstat_update(struct kstat *ksp, int rw)
 	    vmmr_alloc_transient_sz + vmmr_free_transient_sz;
 	vkp->vmrks_bytes_limit.value.ui64 = vmmr_total_limit;
 	mutex_exit(&vmmr_lock);
+
+	/*
+	 * How much of the rawmem pool is free vs. already handed out.
+	 * Distinct from the fields above, which describe the reservoir
+	 * as a whole regardless of which underlying source backs a given
+	 * page.
+	 */
+	rawmem_query(&rawmem_total, &rawmem_free);
+	vkp->vmrks_rawmem_bytes_free.value.ui64 = rawmem_free << PAGESHIFT;
+	vkp->vmrks_rawmem_bytes_alloc.value.ui64 =
+	    (rawmem_total - rawmem_free) << PAGESHIFT;
 
 	return (0);
 }
@@ -595,6 +609,10 @@ vmmr_init()
 	kstat_named_init(&vkp->vmrks_bytes_transient, "bytes_transient_alloc",
 	    KSTAT_DATA_UINT64);
 	kstat_named_init(&vkp->vmrks_bytes_limit, "bytes_limit",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&vkp->vmrks_rawmem_bytes_free, "rawmem_bytes_free",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&vkp->vmrks_rawmem_bytes_alloc, "rawmem_bytes_alloc",
 	    KSTAT_DATA_UINT64);
 	ksp->ks_private = NULL;
 	ksp->ks_update = vmmr_kstat_update;
