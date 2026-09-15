@@ -74,6 +74,7 @@
 
 #include <sys/dumphdr.h>
 #include <sys/bootconf.h>
+#include <sys/rawmem.h>
 #include <sys/memlist_plat.h>
 #include <sys/varargs.h>
 #include <sys/promif.h>
@@ -339,6 +340,25 @@ caddr_t e_moddata;	/* end of loadable module data reserved */
 struct memlist *phys_install;	/* Total installed physical memory */
 struct memlist *phys_avail;	/* Total available physical memory */
 struct memlist *bios_rsvd;	/* Bios reserved memory */
+struct memlist *phys_rawmem;	/* Physical memory withheld from page_t's */
+
+/*
+ * Amount of memory withheld from page_t/memseg management at boot -- just
+ * carved out of phys_avail before page_t's are created for it, so a consumer
+ * can hand it out by PFN with no page_t/page-hash/pse-mutex overhead.
+ */
+pgcnt_t rawmem_pages;
+
+/*
+ * Maximum percentage of memory the rawmem reservation may consume.
+ */
+uint_t rawmem_max_pct = 80;
+
+/*
+ * Internal tracking required for the rawmem reservation.
+ */
+static pgcnt_t rawmem_skip;
+static pgcnt_t rawmem_resv;
 
 /*
  * kphysm_init returns the number of pages that were processed
@@ -553,7 +573,7 @@ int prom_debug;
  * done in startup_memlist(). The value of NUM_ALLOCATIONS needs to
  * be >= the number of ADD_TO_ALLOCATIONS() executed in the code.
  */
-#define	NUM_ALLOCATIONS 8
+#define	NUM_ALLOCATIONS 9
 int num_allocations = 0;
 struct {
 	void **al_ptr;
@@ -703,6 +723,7 @@ startup(void)
 #endif
 	startup_memlist();
 	startup_kmem();
+	rawmem_init();
 	startup_vm();
 #if !defined(__xpv)
 	/*
@@ -770,13 +791,14 @@ startup_init()
 }
 
 /*
- * Callback for copy_memlist_filter() to filter nucleus, kadb/kmdb, (ie.
- * everything mapped above KERNEL_TEXT) pages from phys_avail. Note it
- * also filters out physical page zero.  There is some reliance on the
- * boot loader allocating only a few contiguous physical memory chunks.
+ * Shrink the candidate range [*addr, *addr + *size) down so that it
+ * does not overlap anything mapped above KERNEL_TEXT (nucleus,
+ * kadb/kmdb, loadable module text/data), and excludes physical page zero
+ * (required for BIOS). There is some reliance on the boot loader
+ * allocating only a few contiguous physical memory chunks.
  */
 static void
-avail_filter(uint64_t *addr, uint64_t *size)
+trim_kernel_range(uint64_t *addr, uint64_t *size)
 {
 	uintptr_t va;
 	uintptr_t next_va;
@@ -786,10 +808,6 @@ avail_filter(uint64_t *addr, uint64_t *size)
 	uint_t prot;
 	size_t len;
 	uint_t change;
-
-	if (prom_debug)
-		prom_printf("\tFilter: in: a=%" PRIx64 ", s=%" PRIx64 "\n",
-		    *addr, *size);
 
 	/*
 	 * page zero is required for BIOS.. never make it available
@@ -802,9 +820,9 @@ avail_filter(uint64_t *addr, uint64_t *size)
 	/*
 	 * First we trim from the front of the range. Since kbm_probe()
 	 * walks ranges in virtual order, but addr/size are physical, we need
-	 * to the list until no changes are seen.  This deals with the case
-	 * where page "p" is mapped at v, page "p + PAGESIZE" is mapped at w
-	 * but w < v.
+	 * to traverse the list until no changes are seen.  This deals with
+	 * the case where page "p" is mapped at v, page "p + PAGESIZE" is
+	 * mapped at w but w < v.
 	 */
 	do {
 		change = 0;
@@ -825,9 +843,6 @@ avail_filter(uint64_t *addr, uint64_t *size)
 				}
 			}
 		}
-		if (change && prom_debug)
-			prom_printf("\t\ttrim: a=%" PRIx64 ", s=%" PRIx64 "\n",
-			    *addr, *size);
 	} while (change);
 
 	/*
@@ -843,10 +858,81 @@ avail_filter(uint64_t *addr, uint64_t *size)
 		if (pfn_addr >= *addr && pfn_addr < *addr + *size)
 			*size = pfn_addr - *addr;
 	}
+}
+
+/*
+ * Callback for copy_memlist_filter() to build phys_avail: trims kernel-
+ * occupied memory and physical page zero, then stops handing out pages
+ * once the rawmem reservation (rawmem_skip) is reached.
+ */
+static void
+avail_filter(uint64_t *addr, uint64_t *size)
+{
+	if (prom_debug)
+		prom_printf("\tFilter: in: a=%" PRIx64 ", s=%" PRIx64 "\n",
+		    *addr, *size);
+
+	trim_kernel_range(addr, size);
+
+	if (*size > 0) {
+		pgcnt_t pages = *size >> MMU_PAGESHIFT;
+		if (rawmem_skip == 0) {
+			*size = 0;
+		} else {
+			if (pages > rawmem_skip)
+				*size = ptob(rawmem_skip);
+			rawmem_skip -= *size >> MMU_PAGESHIFT;
+		}
+	}
 
 	if (prom_debug)
 		prom_printf("\tFilter out: a=%" PRIx64 ", s=%" PRIx64 "\n",
 		    *addr, *size);
+}
+
+/*
+ * Callback for copy_memlist_filter() to build phys_rawmem: the flat
+ * reservation of the top rawmem_resv pages. Unlike avail_filter(), a
+ * zero size does not complete the scan.
+ */
+static void
+rawmem_filter(uint64_t *addr, uint64_t *size)
+{
+	uint64_t span_end = *addr + *size;
+
+	for (;;) {
+		*size = span_end - *addr;
+		trim_kernel_range(addr, size);
+		if (*size == 0)
+			return;
+
+		pgcnt_t pages = *size >> MMU_PAGESHIFT;
+
+		/*
+		 * Skip rawmem_skip general-pool pages first; whatever remains
+		 * in this window (up to rawmem_resv) is reservation to emit.
+		 */
+		if (rawmem_skip > 0) {
+			pgcnt_t skip = MIN(rawmem_skip, pages);
+
+			rawmem_skip -= skip;
+			*addr += ptob(skip);
+			if (skip == pages) {
+				/*
+				 * This sub-window was fully skipped; loop to
+				 * find the next one before span_end.
+				 */
+				continue;
+			}
+			*size -= ptob(skip);
+			pages -= skip;
+		}
+
+		if (pages > rawmem_resv)
+			*size = ptob(rawmem_resv);
+		rawmem_resv -= *size >> MMU_PAGESHIFT;
+		return;
+	}
 }
 
 static void
@@ -951,6 +1037,7 @@ startup_memlist(void)
 	pgcnt_t rsvd_pgcnt;
 	size_t rsvdmemlist_sz;
 	int rsvdmemblocks;
+	size_t rawmemlist_sz;
 	caddr_t pagecolor_mem;
 	size_t pagecolor_memsz;
 	caddr_t page_ctrs_mem;
@@ -1062,10 +1149,46 @@ startup_memlist(void)
 	PRM_DEBUG(obp_pages);
 
 	/*
+	 * Recompute the rawmem_max_pct cap now that npages is precise.
+	 */
+	const pgcnt_t rawmem_max = (npages * rawmem_max_pct) / 100;
+
+	if (rawmem_pages > rawmem_max) {
+		cmn_err(CE_WARN, "unable to satisfy requested %s of 0x%lx "
+		    "pages without exceeding rawmem_max_pct (%u%%) of "
+		    "memory; only 0x%lx pages reserved", PHYS_RAWMEM_SIZE_PROP,
+		    rawmem_pages, rawmem_max_pct, rawmem_max);
+		rawmem_pages = rawmem_max;
+	}
+	PRM_DEBUG(rawmem_pages);
+
+	npages -= rawmem_pages;
+
+	/*
+	 * Save npages here, since the physmem clamp below may change it.
+	 * We restore this value into rawmem_skip when carving out the
+	 * rawmem area below.
+	 */
+	pgcnt_t rawmem_save_npages = npages;
+
+	/*
 	 * If physmem is patched to be non-zero, use it instead of the computed
 	 * value unless it is larger than the actual amount of memory on hand.
 	 */
 	if (physmem == 0 || physmem > npages) {
+		/*
+		 * Warn only if rawmem_pages caused the error -- i.e.
+		 * physmem would have fit before the reservation shrank
+		 * npages -- not for an ordinary oversized physmem.
+		 */
+		if (physmem > npages && rawmem_pages > 0 &&
+		    physmem <= rawmem_save_npages + rawmem_pages) {
+			cmn_err(CE_WARN, "physmem=0x%lx cannot be honored: "
+			    "only 0x%lx pages remain after the %s "
+			    "reservation of 0x%lx pages; limiting physmem "
+			    "to 0x%lx pages", physmem, npages,
+			    PHYS_RAWMEM_SIZE_PROP, rawmem_pages, npages);
+		}
 		physmem = npages;
 	} else if (physmem < npages) {
 		orig_npages = npages;
@@ -1103,6 +1226,16 @@ startup_memlist(void)
 	    (rsvdmemblocks + POSS_NEW_FRAGMENTS));
 	ADD_TO_ALLOCATIONS(bios_rsvd, rsvdmemlist_sz);
 	PRM_DEBUG(rsvdmemlist_sz);
+
+	/*
+	 * Reserve space for the phys_rawmem memlist.  The reservation is
+	 * flat (a single range at the top of the whole system), so this
+	 * needs no more headroom than any other memlist here.
+	 */
+	rawmemlist_sz = ROUND_UP_PAGE(2 * sizeof (struct memlist) *
+	    (memblocks + POSS_NEW_FRAGMENTS));
+	ADD_TO_ALLOCATIONS(phys_rawmem, rawmemlist_sz);
+	PRM_DEBUG(rawmemlist_sz);
 
 	/* LINTED */
 	ASSERT(P2SAMEHIGHBIT((1 << PP_SHIFT), sizeof (struct page)));
@@ -1217,6 +1350,7 @@ startup_memlist(void)
 
 	phys_avail = current;
 	PRM_POINT("Building phys_avail:\n");
+	rawmem_skip = rawmem_save_npages;
 	copy_memlist_filter(bootops->boot_mem->physinstalled, &current,
 	    avail_filter);
 	if ((caddr_t)current > (caddr_t)memlist + memlist_sz)
@@ -1251,6 +1385,35 @@ startup_memlist(void)
 	if ((caddr_t)current < (caddr_t)bios_rsvd + rsvdmemlist_sz) {
 		memlist_free_block((caddr_t)current,
 		    (caddr_t)bios_rsvd + rsvdmemlist_sz - (caddr_t)current);
+	}
+#endif
+
+	/*
+	 * Build phys_rawmem: the memory withheld from page_t/memseg
+	 * management, per rawmem_pages/PHYS_RAWMEM_SIZE_PROP.  Reset
+	 * rawmem_skip again -- avail_filter() above has already drained it
+	 * to zero -- and set rawmem_resv for the first time, so
+	 * rawmem_filter() walks the same split from the start, this time
+	 * collecting the reserved tail it previously skipped.
+	 */
+	current = phys_rawmem;
+	PRM_POINT("Building phys_rawmem:\n");
+	rawmem_skip = rawmem_save_npages;
+	rawmem_resv = rawmem_pages;
+	copy_memlist_filter(bootops->boot_mem->physinstalled, &current,
+	    rawmem_filter);
+	if ((caddr_t)current > (caddr_t)phys_rawmem + rawmemlist_sz)
+		panic("phys_rawmem was too big!");
+	if (prom_debug)
+		print_memlist("phys_rawmem", phys_rawmem);
+#ifndef	__xpv
+	/*
+	 * Free unused memlist items, which may be used by memory DR driver
+	 * at runtime.
+	 */
+	if ((caddr_t)current < (caddr_t)phys_rawmem + rawmemlist_sz) {
+		memlist_free_block((caddr_t)current,
+		    (caddr_t)phys_rawmem + rawmemlist_sz - (caddr_t)current);
 	}
 #endif
 

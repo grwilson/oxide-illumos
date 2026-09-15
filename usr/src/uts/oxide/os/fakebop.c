@@ -72,6 +72,7 @@
 #include <sys/ddipropdefs.h>	/* For DDI prop types */
 #include <sys/dw_apb_uart.h>
 #include <sys/uart.h>
+#include <sys/memlist_plat.h>
 #include <sys/apob.h>
 #include <sys/kapob.h>
 #include <sys/io/zen/ccx.h>
@@ -675,6 +676,7 @@ wait_for_psp(void)
  * greater knowledge and control of our environment, sufficiently so that one
  * day this might look more like the sun4 code than i86pc.
  */
+
 void
 _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 {
@@ -733,6 +735,43 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	if (reset_vector != 0) {
 		eb_physmem_reserve_range(reset_vector & PAGEMASK, PAGESIZE,
 		    EBPR_NO_ALLOC);
+	}
+
+	/*
+	 * Read PHYS_RAWMEM_SIZE_PROP and, if set, withhold the top
+	 * rawmem_pages from eb_phys_alloc() -- before _kobj_boot()'s module
+	 * loading and startup_memlist()'s own allocations could otherwise
+	 * land inside the range later withheld from page_t management.
+	 * Capped at rawmem_max_pct of memory (sys/bootconf.h).
+	 */
+	uint64_t rawmem_bytes;
+	pfn_t high_pfn;
+	pgcnt_t total;
+
+	installed_top_size(bm.physinstalled, &high_pfn, &total);
+
+	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP, ptob(total),
+	    &rawmem_bytes) == 0)
+		rawmem_pages = btop(rawmem_bytes);
+	else
+		rawmem_pages = 0;
+
+	if (rawmem_pages > 0) {
+		pgcnt_t rawmem_max = (total * rawmem_max_pct) / 100;
+		struct memlist *ml;
+		uint64_t top = 0;
+
+		if (rawmem_pages > rawmem_max)
+			rawmem_pages = rawmem_max;
+
+		for (ml = bm.physinstalled; ml != NULL; ml = ml->ml_next) {
+			uint64_t end = ml->ml_address + ml->ml_size;
+			if (end > top)
+				top = end;
+		}
+
+		eb_physmem_reserve_range(top - ptob(rawmem_pages),
+		    ptob(rawmem_pages), EBPR_NO_ALLOC);
 	}
 
 	/*
@@ -808,6 +847,134 @@ bootprop_getstr(const char *prop_name, char *buf, size_t buflen)
 	if (boot_prop_len < 0 || boot_prop_len >= buflen ||
 	    BOP_GETPROP(bootops, prop_name, buf) < 0)
 		return (-1);
+
+	return (0);
+}
+
+/*
+ * Minimal early-boot-safe integer parser (decimal, or "0x"/"0" for hex/octal),
+ * used only by bootprop_getsize() below.  This deliberately does not use the
+ * common kobj_getvalue(): that lives in genunix, which krtld/_kobj_boot() has
+ * not yet loaded and relocated calls into at the point bootprop_getsize() is
+ * called from _start() -- calling it there faults at a fixed (call-target)
+ * address regardless of the property's actual value.
+ */
+static int
+parse_value(const char *p, uint64_t *retval)
+{
+	uint64_t tmp = 0;
+	int digit;
+	int radix = 10;
+
+	if (*p == '0') {
+		++p;
+		if (*p == 0) {
+			*retval = 0;
+			return (0);
+		}
+		if (*p == 'x' || *p == 'X') {
+			radix = 16;
+			++p;
+		} else {
+			radix = 8;
+			++p;
+		}
+	}
+	while (*p) {
+		if ('0' <= *p && *p <= '9')
+			digit = *p - '0';
+		else if ('a' <= *p && *p <= 'f')
+			digit = 10 + *p - 'a';
+		else if ('A' <= *p && *p <= 'F')
+			digit = 10 + *p - 'A';
+		else
+			return (-1);
+		if (digit >= radix)
+			return (-1);
+		tmp = tmp * radix + digit;
+		++p;
+	}
+	*retval = tmp;
+	return (0);
+}
+
+/*
+ * Like bootprop_getval(), but the property value may carry an optional
+ * trailing k/K, m/M, g/G, or t/T suffix (base-1024) scaling it into a byte
+ * count, or a trailing '%' expressing it as an integer percentage of
+ * `total`.
+ */
+/* XXX shareable */
+int
+bootprop_getsize(const char *prop_name, uint64_t total, uint64_t *prop_value)
+{
+	int		boot_prop_len;
+	char		str[BP_MAX_STRLEN];
+	uint64_t	value;
+	uint64_t	scale = 1;
+	size_t		len;
+	boolean_t	is_pct = B_FALSE;
+
+	/*
+	 * Called before bootops (which BOP_GETPROPLEN()/BOP_GETPROP()
+	 * dereference) is set up, so use do_bsys_getproplen()/
+	 * do_bsys_getprop() directly, as the "physmem" handling does.
+	 */
+	boot_prop_len = do_bsys_getproplen(NULL, prop_name);
+	if (boot_prop_len < 0 || boot_prop_len >= sizeof (str) ||
+	    do_bsys_getprop(NULL, prop_name, str) < 0)
+		return (-1);
+
+	len = strlen(str);
+	if (len > 0) {
+		switch (str[len - 1]) {
+		case 'K':
+		case 'k':
+			scale = 1ULL << 10;
+			str[len - 1] = '\0';
+			break;
+		case 'M':
+		case 'm':
+			scale = 1ULL << 20;
+			str[len - 1] = '\0';
+			break;
+		case 'G':
+		case 'g':
+			scale = 1ULL << 30;
+			str[len - 1] = '\0';
+			break;
+		case 'T':
+		case 't':
+			scale = 1ULL << 40;
+			str[len - 1] = '\0';
+			break;
+		case '%':
+			is_pct = B_TRUE;
+			str[len - 1] = '\0';
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (parse_value(str, &value) == -1)
+		return (-1);
+
+	if (is_pct) {
+		if (value > 100)
+			return (-1);
+		if (value != 0 && (-1ULL / value) < total)
+			return (-1);
+		if (prop_value != NULL)
+			*prop_value = (total * value) / 100;
+		return (0);
+	}
+
+	if (value != 0 && (-1ULL / scale) < value)
+		return (-1);
+
+	if (prop_value != NULL)
+		*prop_value = value * scale;
 
 	return (0);
 }

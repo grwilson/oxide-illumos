@@ -39,6 +39,7 @@
 
 #include <sys/types.h>
 #include <sys/bootconf.h>
+#include <sys/memlist_plat.h>
 #include <sys/bootsvcs.h>
 #include <sys/bootinfo.h>
 #include <sys/multiboot.h>
@@ -109,6 +110,14 @@ static struct xboot_info *xbootp;
 static uintptr_t next_virt;	/* next available virtual address */
 static paddr_t next_phys;	/* next available physical address from dboot */
 static paddr_t high_phys = -(paddr_t)1;	/* last used physical address */
+
+/*
+ * Upper bound (in pages) on what do_bop_phys_alloc() may hand out, imposed
+ * by the rawmem reservation computed in read_bootenvrc() -- see
+ * bop_set_rawmem_base().
+ */
+static pgcnt_t rawmem_base_pages = 0;
+static boolean_t rawmem_base_active = B_FALSE;
 
 /*
  * buffer for vsnprintf for console I/O
@@ -215,6 +224,15 @@ do_bop_phys_alloc(uint64_t size, uint64_t align)
 		high_phys = pfn_to_pa(physmem);
 
 	/*
+	 * Likewise for the rawmem reservation, if one has been set by
+	 * read_bootenvrc() (via bop_set_rawmem_base()) -- keeps this
+	 * allocator out of the memory reserved for page_t-less use.
+	 */
+	if (rawmem_base_active &&
+	    high_phys > pfn_to_pa(rawmem_base_pages))
+		high_phys = pfn_to_pa(rawmem_base_pages);
+
+	/*
 	 * find the highest available memory in physinstalled
 	 */
 	size = P2ROUNDUP(size, align);
@@ -253,6 +271,17 @@ do_bop_phys_alloc(uint64_t size, uint64_t align)
 	bop_panic("do_bop_phys_alloc(0x%" PRIx64 ", 0x%" PRIx64
 	    ") Out of memory\n", size, align);
 	/*NOTREACHED*/
+}
+
+/*
+ * Called by read_bootenvrc() once it has computed how many pages are to
+ * be withheld from page_t/memseg for the rawmem reservation.
+ */
+void
+bop_set_rawmem_base(pgcnt_t pages)
+{
+	rawmem_base_pages = pages;
+	rawmem_base_active = B_TRUE;
 }
 
 uintptr_t
@@ -671,6 +700,7 @@ boot_prop_display(char *buffer)
  *
  * we do single character I/O since this is really just looking at memory
  */
+
 void
 read_bootenvrc(void)
 {
@@ -817,6 +847,33 @@ done:
 			DBG(physmem);
 		}
 	}
+
+	/*
+	 * Read PHYS_RAWMEM_SIZE_PROP and, if set, keep do_bop_phys_alloc()
+	 * out of the top rawmem_pages of memory -- before early_allocation
+	 * clears and everything else starts competing for high addresses.
+	 * Capped at rawmem_max_pct of memory.
+	 */
+	uint64_t rawmem_bytes;
+	pfn_t high_pfn;
+	pgcnt_t total_pages;
+
+	installed_top_size((struct memlist *)xbootp->bi_phys_install,
+	    &high_pfn, &total_pages);
+
+	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP,
+	    ptob(total_pages), &rawmem_bytes) == 0) {
+		rawmem_pages = btop(rawmem_bytes);
+
+		pgcnt_t rawmem_max = (total_pages * rawmem_max_pct) / 100;
+
+		if (rawmem_pages > rawmem_max)
+			rawmem_pages = rawmem_max;
+		bop_set_rawmem_base(total_pages - rawmem_pages);
+	} else {
+		rawmem_pages = 0;
+	}
+
 	early_allocation = 0;
 
 	/*
@@ -3054,6 +3111,86 @@ bootprop_getstr(const char *prop_name, char *buf, size_t buflen)
 	if (boot_prop_len < 0 || boot_prop_len >= buflen ||
 	    BOP_GETPROP(bootops, prop_name, buf) < 0)
 		return (-1);
+
+	return (0);
+}
+
+/*
+ * Like bootprop_getval(), but the property value may carry an optional
+ * trailing k/K, m/M, g/G, or t/T suffix (base-1024) scaling it into a byte
+ * count, or a trailing '%' expressing it as an integer percentage of
+ * `total`.
+ */
+int
+bootprop_getsize(const char *prop_name, uint64_t total, uint64_t *prop_value)
+{
+	int		boot_prop_len;
+	char		str[BP_MAX_STRLEN];
+	uint64_t	value;
+	uint64_t	scale = 1;
+	size_t		len;
+	boolean_t	is_pct = B_FALSE;
+
+	/*
+	 * Called before bootops (which BOP_GETPROPLEN()/BOP_GETPROP()
+	 * dereference) is set up, so use do_bsys_getproplen()/
+	 * do_bsys_getprop() directly, as the "physmem" handling above does.
+	 */
+	boot_prop_len = do_bsys_getproplen(NULL, prop_name);
+	if (boot_prop_len < 0 || boot_prop_len >= sizeof (str) ||
+	    do_bsys_getprop(NULL, prop_name, str) < 0)
+		return (-1);
+
+	len = strlen(str);
+	if (len > 0) {
+		switch (str[len - 1]) {
+		case 'K':
+		case 'k':
+			scale = 1ULL << 10;
+			str[len - 1] = '\0';
+			break;
+		case 'M':
+		case 'm':
+			scale = 1ULL << 20;
+			str[len - 1] = '\0';
+			break;
+		case 'G':
+		case 'g':
+			scale = 1ULL << 30;
+			str[len - 1] = '\0';
+			break;
+		case 'T':
+		case 't':
+			scale = 1ULL << 40;
+			str[len - 1] = '\0';
+			break;
+		case '%':
+			is_pct = B_TRUE;
+			str[len - 1] = '\0';
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (parse_value(str, &value) == -1)
+		return (-1);
+
+	if (is_pct) {
+		if (value > 100)
+			return (-1);
+		if (value != 0 && (-1ULL / value) < total)
+			return (-1);
+		if (prop_value != NULL)
+			*prop_value = (total * value) / 100;
+		return (0);
+	}
+
+	if (value != 0 && (-1ULL / scale) < value)
+		return (-1);
+
+	if (prop_value != NULL)
+		*prop_value = value * scale;
 
 	return (0);
 }
