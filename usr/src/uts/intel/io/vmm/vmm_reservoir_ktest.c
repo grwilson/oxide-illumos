@@ -46,37 +46,37 @@ typedef struct vmmr_ktest_fns {
 } vmmr_ktest_fns_t;
 
 static int
-vmmr_ktest_resolve(ddi_modhandle_t hdl, vmmr_ktest_fns_t *fns)
+vmmr_ktest_resolve(ddi_modhandle_t hdl, vmmr_ktest_fns_t *vkf)
 {
-	if (ktest_get_fn(hdl, "vmmr_alloc", (void **)&fns->vkf_alloc) != 0)
+	if (ktest_get_fn(hdl, "vmmr_alloc", (void **)&vkf->vkf_alloc) != 0)
 		return (-1);
-	if (ktest_get_fn(hdl, "vmmr_free", (void **)&fns->vkf_free) != 0)
+	if (ktest_get_fn(hdl, "vmmr_free", (void **)&vkf->vkf_free) != 0)
 		return (-1);
 	if (ktest_get_fn(hdl, "vmmr_region_pfn_at",
-	    (void **)&fns->vkf_pfn_at) != 0)
+	    (void **)&vkf->vkf_pfn_at) != 0)
 		return (-1);
 	if (ktest_get_fn(hdl, "vmmr_is_empty",
-	    (void **)&fns->vkf_is_empty) != 0)
+	    (void **)&vkf->vkf_is_empty) != 0)
 		return (-1);
 	return (0);
 }
 
 /*
- * Hold the vmm module and resolve the reservoir symbols into *fns, reporting
+ * Hold the vmm module and resolve the reservoir symbols into *vkf, reporting
  * a KT_ERROR on either failure.  On failure, *hdlp is left NULL (any partial
  * hold is released here) so callers can unconditionally test it before
  * calling ktest_release_mod() in their own cleanup path.
  */
 static bool
 vmmr_ktest_setup(ktest_ctx_hdl_t *ctx, ddi_modhandle_t *hdlp,
-    vmmr_ktest_fns_t *fns)
+    vmmr_ktest_fns_t *vkf)
 {
 	if (ktest_hold_mod("drv/vmm", hdlp) != 0) {
 		KT_ERROR(ctx, "failed to hold 'vmm' module");
 		*hdlp = NULL;
 		return (false);
 	}
-	if (vmmr_ktest_resolve(*hdlp, fns) != 0) {
+	if (vmmr_ktest_resolve(*hdlp, vkf) != 0) {
 		KT_ERROR(ctx, "failed to resolve vmm reservoir symbols");
 		ktest_release_mod(*hdlp);
 		*hdlp = NULL;
@@ -89,20 +89,20 @@ static void
 vmmr_ktest_basic_alloc_free(ktest_ctx_hdl_t *ctx)
 {
 	ddi_modhandle_t hdl = NULL;
-	vmmr_ktest_fns_t fns = { 0 };
+	vmmr_ktest_fns_t vkf = { 0 };
 	vmmr_region_t *region = NULL;
 
-	if (!vmmr_ktest_setup(ctx, &hdl, &fns))
+	if (!vmmr_ktest_setup(ctx, &hdl, &vkf))
 		return;
 
 	const uint_t npages = 4;
 	const size_t sz = npages << PAGESHIFT;
 
-	KT_EASSERT0G(fns.vkf_alloc(sz, true, &region), ctx, cleanup);
+	KT_EASSERT0G(vkf.vkf_alloc(sz, true, &region), ctx, cleanup);
 
 	pfn_t pfns[4];
 	for (uint_t i = 0; i < npages; i++) {
-		pfns[i] = fns.vkf_pfn_at(region, i << PAGESHIFT);
+		pfns[i] = vkf.vkf_pfn_at(region, i << PAGESHIFT);
 	}
 	for (uint_t i = 0; i < npages; i++) {
 		for (uint_t j = i + 1; j < npages; j++) {
@@ -110,14 +110,14 @@ vmmr_ktest_basic_alloc_free(ktest_ctx_hdl_t *ctx)
 				KT_FAIL(ctx,
 				    "duplicate pfn %lu at offsets %u and %u",
 				    pfns[i], i, j);
-				fns.vkf_free(region);
+				vkf.vkf_free(region);
 				goto cleanup;
 			}
 		}
 	}
 
-	fns.vkf_free(region);
-	KT_ASSERTG(fns.vkf_is_empty(), ctx, cleanup);
+	vkf.vkf_free(region);
+	KT_ASSERTG(vkf.vkf_is_empty(), ctx, cleanup);
 
 	KT_PASS(ctx);
 
@@ -150,26 +150,26 @@ vmmr_ktest_rawmem_engaged(ktest_ctx_hdl_t *ctx)
 	}
 
 	ddi_modhandle_t hdl = NULL;
-	vmmr_ktest_fns_t fns = { 0 };
+	vmmr_ktest_fns_t vkf = { 0 };
 	vmmr_region_t *region = NULL;
 
-	if (!vmmr_ktest_setup(ctx, &hdl, &fns))
+	if (!vmmr_ktest_setup(ctx, &hdl, &vkf))
 		return;
 
 	const pgcnt_t req_pages = MIN(free_before, 64);
 	const size_t sz = req_pages << PAGESHIFT;
 
-	KT_EASSERT0G(fns.vkf_alloc(sz, true, &region), ctx, cleanup);
+	KT_EASSERT0G(vkf.vkf_alloc(sz, true, &region), ctx, cleanup);
 
 	/* Touch the endpoints to exercise the rawmem PFN-lookup path. */
-	(void) fns.vkf_pfn_at(region, 0);
-	(void) fns.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
+	(void) vkf.vkf_pfn_at(region, 0);
+	(void) vkf.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
 
 	pgcnt_t free_after;
 	rawmem_query(NULL, &free_after);
 	KT_ASSERT3UG(free_before - free_after, ==, req_pages, ctx, cleanup_region);
 
-	fns.vkf_free(region);
+	vkf.vkf_free(region);
 	region = NULL;
 
 	pgcnt_t free_restored;
@@ -180,7 +180,7 @@ vmmr_ktest_rawmem_engaged(ktest_ctx_hdl_t *ctx)
 	goto cleanup;
 
 cleanup_region:
-	fns.vkf_free(region);
+	vkf.vkf_free(region);
 cleanup:
 	if (hdl != NULL) {
 		ktest_release_mod(hdl);
@@ -212,16 +212,16 @@ vmmr_ktest_rawmem_overflow_small(ktest_ctx_hdl_t *ctx)
 	}
 
 	ddi_modhandle_t hdl = NULL;
-	vmmr_ktest_fns_t fns = { 0 };
+	vmmr_ktest_fns_t vkf = { 0 };
 	vmmr_region_t *region = NULL;
 
-	if (!vmmr_ktest_setup(ctx, &hdl, &fns))
+	if (!vmmr_ktest_setup(ctx, &hdl, &vkf))
 		return;
 
 	const pgcnt_t req_pages = total + 4;
 	const size_t sz = req_pages << PAGESHIFT;
 
-	const int err = fns.vkf_alloc(sz, true, &region);
+	const int err = vkf.vkf_alloc(sz, true, &region);
 	if (err != 0) {
 		KT_SKIP(ctx, "reservoir limit too small for overflow test");
 		goto cleanup;
@@ -231,10 +231,10 @@ vmmr_ktest_rawmem_overflow_small(ktest_ctx_hdl_t *ctx)
 	rawmem_query(NULL, &free_after);
 	KT_ASSERT3UG(free_after, ==, 0, ctx, cleanup_region);
 
-	(void) fns.vkf_pfn_at(region, 0);
-	(void) fns.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
+	(void) vkf.vkf_pfn_at(region, 0);
+	(void) vkf.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
 
-	fns.vkf_free(region);
+	vkf.vkf_free(region);
 	region = NULL;
 
 	pgcnt_t free_restored;
@@ -245,7 +245,7 @@ vmmr_ktest_rawmem_overflow_small(ktest_ctx_hdl_t *ctx)
 	goto cleanup;
 
 cleanup_region:
-	fns.vkf_free(region);
+	vkf.vkf_free(region);
 cleanup:
 	if (hdl != NULL) {
 		ktest_release_mod(hdl);
@@ -275,10 +275,10 @@ vmmr_ktest_rawmem_overflow_large(ktest_ctx_hdl_t *ctx)
 	}
 
 	ddi_modhandle_t hdl = NULL;
-	vmmr_ktest_fns_t fns = { 0 };
+	vmmr_ktest_fns_t vkf = { 0 };
 	vmmr_region_t *region = NULL;
 
-	if (!vmmr_ktest_setup(ctx, &hdl, &fns))
+	if (!vmmr_ktest_setup(ctx, &hdl, &vkf))
 		return;
 
 	pgcnt_t *lpgcnt_ptr = NULL;
@@ -298,16 +298,16 @@ vmmr_ktest_rawmem_overflow_large(ktest_ctx_hdl_t *ctx)
 	const pgcnt_t req_pages = total + (2 * lpgcnt);
 	const size_t sz = req_pages << PAGESHIFT;
 
-	KT_EASSERT0G(fns.vkf_alloc(sz, true, &region), ctx, cleanup);
+	KT_EASSERT0G(vkf.vkf_alloc(sz, true, &region), ctx, cleanup);
 
 	pgcnt_t free_after;
 	rawmem_query(NULL, &free_after);
 	KT_ASSERT3UG(free_after, ==, 0, ctx, cleanup_region);
 
-	(void) fns.vkf_pfn_at(region, 0);
-	(void) fns.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
+	(void) vkf.vkf_pfn_at(region, 0);
+	(void) vkf.vkf_pfn_at(region, sz - (1 << PAGESHIFT));
 
-	fns.vkf_free(region);
+	vkf.vkf_free(region);
 	region = NULL;
 
 	pgcnt_t free_restored;
@@ -318,7 +318,7 @@ vmmr_ktest_rawmem_overflow_large(ktest_ctx_hdl_t *ctx)
 	goto cleanup;
 
 cleanup_region:
-	fns.vkf_free(region);
+	vkf.vkf_free(region);
 cleanup:
 	if (hdl != NULL) {
 		ktest_release_mod(hdl);

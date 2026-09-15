@@ -44,10 +44,10 @@ typedef struct mdb_vmm_softc {
 } mdb_vmm_softc_t;
 
 typedef struct mdb_vmmr_rawmem_chunk {
-	uintptr_t	vb_base;
-	pfn_t		vb_pfn;
-	pgcnt_t		vb_pages;
-	pgcnt_t		vb_nfree;
+	uintptr_t	vrc_base;
+	pfn_t		vrc_pfn;
+	pgcnt_t		vrc_pages;
+	pgcnt_t		vrc_nfree;
 } mdb_vmmr_rawmem_chunk_t;
 
 static uintptr_t mdb_zone0;
@@ -143,8 +143,8 @@ vmmr_rawmem_cb(uintptr_t addr, const void *unknown, void *arg)
 		return (WALK_ERR);
 	}
 
-	mdb_printf("%0?p %0?p %9lx %8lu %8lu\n", addr, chunk.vb_base,
-	    chunk.vb_pfn, chunk.vb_pages, chunk.vb_pages - chunk.vb_nfree);
+	mdb_printf("%0?p %0?p %9lx %8lu %8lu\n", addr, chunk.vrc_base,
+	    chunk.vrc_pfn, chunk.vrc_pages, chunk.vrc_pages - chunk.vrc_nfree);
 
 	return (WALK_NEXT);
 }
