@@ -24,6 +24,7 @@ INC_PATH	+= -I$(UTSBASE)/intel/io/vmm
 LDFLAGS		+= -N drv/ktest
 
 VMM_KTEST_OBJS = \
-	vmm_reservoir_ktest.o
+	vmm_reservoir_ktest.o \
+	rawmem_ktest.o
 
 include $(UTSBASE)/intel/io/vmm/Makefile.rules

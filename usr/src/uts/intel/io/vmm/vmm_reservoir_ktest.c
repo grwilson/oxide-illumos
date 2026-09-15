@@ -30,8 +30,12 @@
 #include <sys/ktest.h>
 #include <sys/modctl.h>
 #include <sys/sysmacros.h>
+#include <sys/errno.h>
 #include <sys/rawmem.h>
 #include <sys/vmm_reservoir.h>
+
+/* Defined in rawmem_ktest.c; registers the "rawmem" suite into *km. */
+extern int rawmem_ktest_register(ktest_module_hdl_t *km);
 
 typedef int (*vmmr_alloc_fn_t)(size_t, bool, vmmr_region_t **);
 typedef void (*vmmr_free_fn_t)(vmmr_region_t *);
@@ -352,6 +356,11 @@ _init(void)
 	    vmmr_ktest_rawmem_overflow_small, KTEST_FLAG_NONE));
 	VERIFY0(ktest_add_test(ks, "vmmr_ktest_rawmem_overflow_large",
 	    vmmr_ktest_rawmem_overflow_large, KTEST_FLAG_NONE));
+
+	if (rawmem_ktest_register(km) != 0) {
+		ktest_free_module(km);
+		return (ENOMEM);
+	}
 
 	if ((ret = ktest_register_module(km)) != 0) {
 		ktest_free_module(km);
