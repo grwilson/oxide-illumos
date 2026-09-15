@@ -19,11 +19,12 @@
 /*
  * Generic, consumer-agnostic allocator over phys_rawmem -- the flat,
  * PFN-range reservation carved out of page_t/memseg management at boot
- * (see PHYS_RAWMEM_SIZE_PROP in sys/bootconf.h, and avail_filter()/
- * rawmem_filter() in startup.c).  Hands out PFNs directly; callers with
- * no page_t to work with must use hat_kpm_pfn2va() (or similar) if they
- * need a kernel VA, and are responsible for their own zeroing policy --
- * this layer knows nothing about vnodes, EPT, or any particular consumer.
+ * (see PHYS_RAWMEM_SIZE_PROP in sys/bootconf.h, and rawmem_filter()
+ * below and avail_filter() in startup.c).  Hands out PFNs directly;
+ * callers with no page_t to work with must use hat_kpm_pfn2va() (or
+ * similar) if they need a kernel VA, and are responsible for their own
+ * zeroing policy -- this layer knows nothing about vnodes, EPT, or any
+ * particular consumer.
  *
  * Where phys_rawmem sits in the physical address space:
  *
@@ -37,7 +38,7 @@
  *              |  (page_t-backed;     |   still carries a page_t, page-hash
  *              |   general use)       |   bucket, and pse mutex.
  *              +----------------------+
- *              | kernel text/data,    |   trimmed by trim_kernel_occupied();
+ *              | kernel text/data,    |   trimmed by trim_kernel_range();
  *              | pfn 0 (BIOS-reserved)|   excluded from both pools above.
  *              +----------------------+
  *                    pfn 0
@@ -57,10 +58,19 @@ extern "C" {
 
 /*
  * The flat PFN-range reservation itself, built by startup_memlist() (see
- * rawmem_filter()) before rawmem_init() ever runs.  NULL if
+ * rawmem_filter() below) before rawmem_init() ever runs.  NULL if
  * PHYS_RAWMEM_SIZE_PROP was unset or clamped to 0.
  */
 extern struct memlist *phys_rawmem;
+
+/*
+ * Callback for copy_memlist_filter(), called from startup_memlist() to
+ * build phys_rawmem: the flat reservation of the top rawmem_resv pages.
+ * Identical on every platform, unlike avail_filter() in startup.c, so
+ * it lives here instead.  Unlike avail_filter(), a zero size does not
+ * complete the scan -- see the implementation for why.
+ */
+extern void rawmem_filter(uint64_t *addr, uint64_t *size);
 
 /*
  * Called once, after phys_rawmem exists and after the kmem/vmem

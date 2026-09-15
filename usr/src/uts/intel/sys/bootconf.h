@@ -264,6 +264,24 @@ extern pgcnt_t rawmem_pages;
 extern uint_t rawmem_max_pct;
 
 /*
+ * Internal tracking used by avail_filter()/rawmem_filter() (see
+ * sys/rawmem.h) while carving phys_avail/phys_rawmem out of
+ * phys_install during startup_memlist().  rawmem_skip is the number of
+ * free general-pool pages still to skip before the reservation begins;
+ * rawmem_resv is the number of free pages remaining within the
+ * reservation itself.  Defined once per platform in startup.c.
+ */
+extern pgcnt_t rawmem_skip;
+extern pgcnt_t rawmem_resv;
+
+/*
+ * Shrink [*addr, *addr + *size) to exclude kernel-occupied memory (and,
+ * platform-dependent, physical page zero).  Defined in startup.c; used
+ * by both avail_filter() there and rawmem_filter() in rawmem.c.
+ */
+extern void trim_kernel_range(uint64_t *, uint64_t *);
+
+/*
  * Back door to fakebop.c to get physical memory allocated.
  * 64 bit data types are fixed for 32 bit PAE use.  Likewise
  * for virtual address space.

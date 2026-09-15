@@ -355,10 +355,11 @@ pgcnt_t rawmem_pages;
 uint_t rawmem_max_pct = 80;
 
 /*
- * Internal tracking required for the rawmem reservation.
+ * Internal tracking required for the rawmem reservation (see
+ * sys/bootconf.h; also used by rawmem_filter() in rawmem.c).
  */
-static pgcnt_t rawmem_skip;
-static pgcnt_t rawmem_resv;
+pgcnt_t rawmem_skip;
+pgcnt_t rawmem_resv;
 
 /*
  * kphysm_init returns the number of pages that were processed
@@ -797,7 +798,7 @@ startup_init()
  * (required for BIOS). There is some reliance on the boot loader
  * allocating only a few contiguous physical memory chunks.
  */
-static void
+void
 trim_kernel_range(uint64_t *addr, uint64_t *size)
 {
 	uintptr_t va;
@@ -888,51 +889,6 @@ avail_filter(uint64_t *addr, uint64_t *size)
 	if (prom_debug)
 		prom_printf("\tFilter out: a=%" PRIx64 ", s=%" PRIx64 "\n",
 		    *addr, *size);
-}
-
-/*
- * Callback for copy_memlist_filter() to build phys_rawmem: the flat
- * reservation of the top rawmem_resv pages. Unlike avail_filter(), a
- * zero size does not complete the scan.
- */
-static void
-rawmem_filter(uint64_t *addr, uint64_t *size)
-{
-	uint64_t span_end = *addr + *size;
-
-	for (;;) {
-		*size = span_end - *addr;
-		trim_kernel_range(addr, size);
-		if (*size == 0)
-			return;
-
-		pgcnt_t pages = *size >> MMU_PAGESHIFT;
-
-		/*
-		 * Skip rawmem_skip general-pool pages first; whatever remains
-		 * in this window (up to rawmem_resv) is reservation to emit.
-		 */
-		if (rawmem_skip > 0) {
-			pgcnt_t skip = MIN(rawmem_skip, pages);
-
-			rawmem_skip -= skip;
-			*addr += ptob(skip);
-			if (skip == pages) {
-				/*
-				 * This sub-window was fully skipped; loop to
-				 * find the next one before span_end.
-				 */
-				continue;
-			}
-			*size -= ptob(skip);
-			pages -= skip;
-		}
-
-		if (pages > rawmem_resv)
-			*size = ptob(rawmem_resv);
-		rawmem_resv -= *size >> MMU_PAGESHIFT;
-		return;
-	}
 }
 
 static void
