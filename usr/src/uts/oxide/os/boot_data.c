@@ -269,6 +269,7 @@ eb_create_common_properties(uint64_t ramdisk_paddr, size_t ramdisk_len,
 	bt_set_prop_str(BTPROP_NAME_WHOAMI,
 	    "/platform/oxide/kernel/amd64/unix");
 	bt_set_prop_str(BTPROP_NAME_IMPL_ARCH, "oxide");
+	bt_set_prop_str(PHYS_RAWMEM_SIZE_PROP, "50%");
 
 	if (ramdisk_paddr == 0)
 		bop_panic("Ramdisk parameters were not provided.");
