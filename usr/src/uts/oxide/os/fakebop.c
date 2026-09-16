@@ -738,43 +738,6 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	}
 
 	/*
-	 * Read PHYS_RAWMEM_SIZE_PROP and, if set, withhold the top
-	 * rawmem_pages from eb_phys_alloc() -- before _kobj_boot()'s module
-	 * loading and startup_memlist()'s own allocations could otherwise
-	 * land inside the range later withheld from page_t management.
-	 * Capped at rawmem_max_pct of memory (sys/bootconf.h).
-	 */
-	uint64_t rawmem_bytes;
-	pfn_t high_pfn;
-	pgcnt_t total;
-
-	installed_top_size(bm.physinstalled, &high_pfn, &total);
-
-	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP, ptob(total),
-	    &rawmem_bytes) == 0)
-		rawmem_pages = btop(rawmem_bytes);
-	else
-		rawmem_pages = 0;
-
-	if (rawmem_pages > 0) {
-		pgcnt_t rawmem_max = (total * rawmem_max_pct) / 100;
-		struct memlist *ml;
-		uint64_t top = 0;
-
-		if (rawmem_pages > rawmem_max)
-			rawmem_pages = rawmem_max;
-
-		for (ml = bm.physinstalled; ml != NULL; ml = ml->ml_next) {
-			uint64_t end = ml->ml_address + ml->ml_size;
-			if (end > top)
-				top = end;
-		}
-
-		eb_physmem_reserve_range(top - ptob(rawmem_pages),
-		    ptob(rawmem_pages), EBPR_NO_ALLOC);
-	}
-
-	/*
 	 * Install a GDT and an IDT to catch early pagefaults (shouldn't
 	 * have any).  Also needed for kmdb.
 	 */
@@ -806,6 +769,51 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	_kobj_boot(bsp, NULL, &bootop, NULL);
 
 	/*NOTREACHED*/
+}
+
+/*
+ * Read PHYS_RAWMEM_SIZE_PROP and, if set, withhold the top rawmem_pages
+ * from eb_phys_alloc().  Called from mlsetup(), after zen_apob_reserve_phys()
+ * has grown bootops->boot_mem->physinstalled to the real, fabric-discovered
+ * topology -- the 2 GiB placeholder eb_physmem_init() starts with isn't
+ * enough to size a percentage-based reservation against.  Still well before
+ * startup_memlist() needs rawmem_pages; safe this late because eb_phys_alloc()
+ * allocates strictly low-to-high, so nothing between _start() and here could
+ * have already landed in the top-of-memory region this carves out.
+ */
+void
+oxide_rawmem_init(void)
+{
+	uint64_t rawmem_bytes;
+	pfn_t high_pfn;
+	pgcnt_t total;
+	struct memlist *physinstalled = bootops->boot_mem->physinstalled;
+
+	installed_top_size(physinstalled, &high_pfn, &total);
+
+	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP, ptob(total),
+	    &rawmem_bytes) == 0)
+		rawmem_pages = btop(rawmem_bytes);
+	else
+		rawmem_pages = 0;
+
+	if (rawmem_pages > 0) {
+		pgcnt_t rawmem_max = (total * rawmem_max_pct) / 100;
+		struct memlist *ml;
+		uint64_t top = 0;
+
+		if (rawmem_pages > rawmem_max)
+			rawmem_pages = rawmem_max;
+
+		for (ml = physinstalled; ml != NULL; ml = ml->ml_next) {
+			uint64_t end = ml->ml_address + ml->ml_size;
+			if (end > top)
+				top = end;
+		}
+
+		eb_physmem_reserve_range(top - ptob(rawmem_pages),
+		    ptob(rawmem_pages), EBPR_NO_ALLOC);
+	}
 }
 
 /* XXX shareable */
