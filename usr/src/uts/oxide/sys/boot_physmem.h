@@ -50,6 +50,13 @@ extern void eb_physmem_reserve(const memlist_t *, eb_physmem_reservation_t);
 extern void eb_physmem_reserve_range(uint64_t, uint64_t,
     eb_physmem_reservation_t);
 
+/*
+ * Withholds the rawmem reservation (see sys/rawmem.h) from eb_phys_alloc().
+ * Defined in fakebop.c; called from mlsetup() once the real memory topology
+ * is known.
+ */
+extern void oxide_rawmem_init(void);
+
 #ifdef __cplusplus
 }
 #endif
