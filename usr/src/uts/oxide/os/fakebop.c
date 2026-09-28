@@ -1,4 +1,4 @@
-/*
+*
  * CDDL HEADER START
  *
  * The contents of this file are subject to the terms of the
@@ -66,6 +66,7 @@
 #include <sys/ctype.h>
 #include <vm/kboot_mmu.h>
 #include <vm/hat_pte.h>
+#include <vm/page.h>
 #include <sys/kobj.h>
 #include <sys/kobj_lex.h>
 #include <sys/pci_cfgspace_impl.h>
@@ -771,35 +772,84 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	/*NOTREACHED*/
 }
 
+uint64_t rawmem_earmark_bytes = (44UL << 30); /* 44 GiB */
+uint_t rawmem_percent = 91;
+
 /*
- * Read PHYS_RAWMEM_SIZE_PROP and, if set, withhold the top rawmem_pages
- * from eb_phys_alloc(). This must be called after zen_apob_reserve_phys()
- * has grown bootops->boot_mem->physinstalled to the real, discovered
- * topology.
+ * Matches omicron's RESERVOIR_SZ_ALIGN: the reservoir size is always
+ * rounded down to a 2 MiB boundary.
+ */
+#define	RAWMEM_RESERVOIR_SZ_ALIGN	(2ULL << 20)	/* 2 MiB */
+
+/*
+ * This is how the raw memory reservation is sized on oxide and
+ * mimics the behavior used by omicron to size the VMM reservoir:
+ *
+ *	rawmem_eligible = total_bytes
+ *		- (total_pages * sizeof (page_t))
+ *		- rawmem_earmark_bytes
+ *	rawmem_bytes = rawmem_eligible * rawmem_percent / 100
+ *
+ * total_pages here means physmem *after* the rawmem carve-out (i.e.
+ * btop(total_bytes) - rawmem_pages) -- exactly the quantity this
+ * function is solving for, so the above can't be evaluated by direct
+ * substitution. Let R be this function's result (rawmem_pages, in
+ * pages); equating R with rawmem_bytes/PAGESIZE turns the above into
+ * one linear equation in one unknown:
+ *
+ *	R * PAGESIZE = (rawmem_percent / 100)
+ *		* [total_bytes - sizeof (page_t) * (total_pages - R)
+ *		- rawmem_earmark_bytes]
+ *
+ * Solving for R:
+ *
+ *	R = [rawmem_percent * (total_bytes - rawmem_earmark_bytes)
+ *		- rawmem_percent * sizeof (page_t) * total_pages]
+ *		/ (100 * PAGESIZE - rawmem_percent * sizeof (page_t))
+ */
+static pgcnt_t
+oxide_rawmem_default_pages(uint64_t total_bytes)
+{
+	const uint64_t total_pages = btop(total_bytes);
+
+	if (total_bytes <= rawmem_earmark_bytes)
+		return (0);
+
+	uint64_t term1 = rawmem_percent * (total_bytes - rawmem_earmark_bytes);
+	uint64_t term2 = rawmem_percent * total_pages * sizeof (page_t);
+
+	if (term2 >= term1)
+		return (0);
+
+	uint64_t size_bytes = ptob((term1 - term2) /
+	    (100 * PAGESIZE - rawmem_percent * sizeof (page_t)));
+
+	/* size_bytes -= (size_bytes % RESERVOIR_SZ_ALIGN), per omicron. */
+	size_bytes -= size_bytes % RAWMEM_RESERVOIR_SZ_ALIGN;
+
+	return (btop(size_bytes));
+}
+
+/*
+ * Size and withhold the top rawmem_pages from eb_phys_alloc(), per the
+ * control-plane VMM-eligible-memory policy (oxide_rawmem_default_pages()
+ * above). This must be called after zen_apob_reserve_phys() has grown
+ * bootops->boot_mem->physinstalled to the real, discovered topology.
  */
 void
 oxide_rawmem_init(void)
 {
-	uint64_t rawmem_bytes;
 	pfn_t high_pfn;
 	pgcnt_t total;
 	struct memlist *physinstalled = bootops->boot_mem->physinstalled;
 
 	installed_top_size(physinstalled, &high_pfn, &total);
 
-	if (bootprop_getsize(PHYS_RAWMEM_SIZE_PROP, ptob(total),
-	    &rawmem_bytes) == 0)
-		rawmem_pages = btop(rawmem_bytes);
-	else
-		rawmem_pages = 0;
+	rawmem_pages = oxide_rawmem_default_pages(ptob(total));
 
 	if (rawmem_pages > 0) {
-		pgcnt_t rawmem_max = (total * rawmem_max_pct) / 100;
 		struct memlist *ml;
 		uint64_t top = 0;
-
-		if (rawmem_pages > rawmem_max)
-			rawmem_pages = rawmem_max;
 
 		for (ml = physinstalled; ml != NULL; ml = ml->ml_next) {
 			uint64_t end = ml->ml_address + ml->ml_size;

@@ -324,11 +324,6 @@ struct memlist *phys_rawmem;	/* Physical memory withheld from page_t's */
 pgcnt_t rawmem_pages;
 
 /*
- * Maximum percentage of memory the rawmem reservation may consume.
- */
-uint_t rawmem_max_pct = 80;
-
-/*
  * Internal tracking used by avail_filter()/rawmem_filter() (see
  * sys/rawmem.h) while carving phys_avail/phys_rawmem out of
  * phys_install during startup_memlist().  rawmem_skip is the number of
@@ -1037,18 +1032,6 @@ startup_memlist(void)
 	PRM_DEBUG(npages);
 	PRM_DEBUG(obp_pages);
 
-	/*
-	 * Recompute the rawmem_max_pct cap now that npages is precise.
-	 */
-	const pgcnt_t rawmem_max = (npages * rawmem_max_pct) / 100;
-
-	if (rawmem_pages > rawmem_max) {
-		cmn_err(CE_WARN, "unable to satisfy requested %s of 0x%lx "
-		    "pages without exceeding rawmem_max_pct (%u%%) of "
-		    "memory; only 0x%lx pages reserved", PHYS_RAWMEM_SIZE_PROP,
-		    rawmem_pages, rawmem_max_pct, rawmem_max);
-		rawmem_pages = rawmem_max;
-	}
 	PRM_DEBUG(rawmem_pages);
 
 	npages -= rawmem_pages;
