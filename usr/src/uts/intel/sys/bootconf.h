@@ -243,6 +243,20 @@ extern void read_bootenvrc(void);
 
 extern int bootprop_getval(const char *, u_longlong_t *);
 extern int bootprop_getstr(const char *, char *, size_t);
+extern int bootprop_getsize(const char *, uint64_t, uint64_t *);
+
+/*
+ * Amount of memory (bytes, with an optional k/M/G/T suffix or a '%' of
+ * total installed memory) to withhold from page_t/memseg management at
+ * boot.
+ */
+#define	PHYS_RAWMEM_SIZE_PROP	"phys-rawmem-size"
+extern pgcnt_t rawmem_pages;
+extern uint_t rawmem_max_pct;
+extern pgcnt_t rawmem_skip;
+extern pgcnt_t rawmem_resv;
+
+extern void trim_kernel_range(uint64_t *, uint64_t *);
 
 /*
  * Back door to fakebop.c to get physical memory allocated.

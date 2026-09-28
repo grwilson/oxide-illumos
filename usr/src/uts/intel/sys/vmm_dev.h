@@ -333,6 +333,14 @@ struct vmm_resv_query {
 	size_t	vrq_alloc_sz;
 	size_t	vrq_alloc_transient_sz;
 	size_t	vrq_limit;
+
+	/*
+	 * Total and free capacity of the boot-time rawmem pool, regardless
+	 * of whether it is currently backing the reservoir.  Both are 0
+	 * when rawmem reservation is not configured.
+	 */
+	size_t	vrq_rawmem_total_sz;
+	size_t	vrq_rawmem_free_sz;
 };
 
 struct vmm_resv_target {
