@@ -1458,10 +1458,28 @@ vmmr_ioctl(int cmd, intptr_t arg, int md, cred_t *cr, int *rvalp)
 		res.vrq_limit = vmmr_total_limit;
 		mutex_exit(&vmmr_lock);
 
+		if (ddi_copyout(&res, datap, sizeof (res), md) != 0) {
+			return (EFAULT);
+		}
+		break;
+	}
+	case VMM_RESV_QUERY2: {
+		struct vmm_resv_query2 res;
+		void *datap = (void *)(uintptr_t)arg;
 		pgcnt_t rawmem_total, rawmem_free;
+
+		/* For now, anyone with access to vmmctl device can query */
+		mutex_enter(&vmmr_lock);
+		res.vrq_free_sz = vmmr_free_sz;
+		res.vrq_alloc_sz = vmmr_alloc_sz;
+		res.vrq_alloc_transient_sz = vmmr_alloc_transient_sz;
+		res.vrq_limit = vmmr_total_limit;
+		mutex_exit(&vmmr_lock);
+
 		rawmem_query(&rawmem_total, &rawmem_free);
 		res.vrq_rawmem_total_sz = rawmem_total << PAGESHIFT;
 		res.vrq_rawmem_free_sz = rawmem_free << PAGESHIFT;
+
 		if (ddi_copyout(&res, datap, sizeof (res), md) != 0) {
 			return (EFAULT);
 		}

@@ -333,6 +333,21 @@ struct vmm_resv_query {
 	size_t	vrq_alloc_sz;
 	size_t	vrq_alloc_transient_sz;
 	size_t	vrq_limit;
+};
+
+/*
+ * Superset of vmm_resv_query, returned by the newer VMM_RESV_QUERY2.  A
+ * separate ioctl/struct rather than growing vmm_resv_query in place: the
+ * VMM_RESV_QUERY handler copies out sizeof (struct vmm_resv_query)
+ * unconditionally, with no caller-supplied size, so widening that struct
+ * would make the kernel overflow any consumer still built against the
+ * four-field version.
+ */
+struct vmm_resv_query2 {
+	size_t	vrq_free_sz;
+	size_t	vrq_alloc_sz;
+	size_t	vrq_alloc_transient_sz;
+	size_t	vrq_limit;
 
 	/*
 	 * Total and free capacity of the boot-time rawmem pool, regardless
@@ -490,7 +505,7 @@ struct vm_legacy_cpuid {
  * best-effort activity.  Nothing is to be inferred about the magnitude of a
  * change when the version is modified.  It follows no rules like semver.
  */
-#define	VMM_CURRENT_INTERFACE_VERSION	19
+#define	VMM_CURRENT_INTERFACE_VERSION	20
 
 
 #define	VMMCTL_IOC_BASE		(('V' << 16) | ('M' << 8))
@@ -507,6 +522,7 @@ struct vm_legacy_cpuid {
 
 #define	VMM_RESV_QUERY		(VMMCTL_IOC_BASE | 0x10)
 #define	VMM_RESV_SET_TARGET	(VMMCTL_IOC_BASE | 0x11)
+#define	VMM_RESV_QUERY2		(VMMCTL_IOC_BASE | 0x12)
 
 /* Operations performed in the context of a given vCPU */
 #define	VM_RUN				(VMM_CPU_IOC_BASE | 0x01)
