@@ -812,9 +812,6 @@ oxide_rawmem_default_pages(uint64_t total_bytes)
 {
 	const uint64_t total_pages = btop(total_bytes);
 
-	uint64_t r = total_pages - (total_pages * sizeof (page_t))
-	    - rawmem_earmark_bytes) * rawmem_percent / 100;
-
 	if (total_bytes <= rawmem_earmark_bytes)
 		return (0);
 
@@ -827,12 +824,11 @@ oxide_rawmem_default_pages(uint64_t total_bytes)
 	uint64_t size_bytes = ptob((term1 - term2) /
 	    (100 * PAGESIZE - rawmem_percent * sizeof (page_t)));
 
-	cmn_err(CE_WARN, "raw memory actual %llu, proposed %llu\n",
-	    (u_longlong_t)r, (u_longlong_t)size_bytes);
-	size_bytes = r;
-
 	/* size_bytes -= (size_bytes % RESERVOIR_SZ_ALIGN), per omicron. */
 	size_bytes -= size_bytes % RAWMEM_RESERVOIR_SZ_ALIGN;
+
+	cmn_err(CE_WARN, "raw memory reservation %llu bytes\n",
+	    (u_longlong_t)size_bytes);
 
 	return (btop(size_bytes));
 }

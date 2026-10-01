@@ -1879,10 +1879,14 @@ layout_kernel_va(void)
 	 * separate segment for two reasons: it makes it easy to skip our pages
 	 * on kernel crash dumps, and it helps avoid fragmentation.  With this
 	 * segment, we're expecting significantly-sized allocations only; we'll
-	 * default to 4x the size of physmem.
+	 * default to 4x the size of physmem -- or, if larger, enough to cover
+	 * physmem + rawmem_pages, since that's what vmmr_init() actually
+	 * requests from this arena (see sys/rawmem.h); the 4x default alone
+	 * stops being enough once the rawmem reservation exceeds 3x physmem.
 	 */
 	segkvmm_base = segkp_base + mmu_ptob(segkpsize);
-	size = segkvmmsize != 0 ? mmu_ptob(segkvmmsize) : (physmem_size * 4);
+	size = segkvmmsize != 0 ? mmu_ptob(segkvmmsize) :
+	    MAX(physmem_size * 4, physmem_size + mmu_ptob(rawmem_pages));
 
 	size = MAX(size, SEGVMMMINSIZE);
 	segkvmmsize = mmu_btop(ROUND_UP_LPAGE(size));
