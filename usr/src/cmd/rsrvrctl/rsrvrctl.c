@@ -150,10 +150,10 @@ do_set_target(int fd, size_t sz, size_t chunk)
 static void
 do_query(int fd)
 {
-	struct vmm_resv_query data;
+	struct vmm_resv_query2 data;
 	int res;
 
-	res = ioctl(fd, VMM_RESV_QUERY, &data);
+	res = ioctl(fd, VMM_RESV_QUERY2, &data);
 	if (res != 0) {
 		perror("Could not query reservoir info");
 		return;
