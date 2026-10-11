@@ -1,0 +1,127 @@
+/*
+ * This file and its contents are supplied under the terms of the
+ * Common Development and Distribution License ("CDDL"), version 1.0.
+ * You may only use this file in accordance with the terms of version
+ * 1.0 of the CDDL.
+ *
+ * A full copy of the text of the CDDL should have accompanied this
+ * source.  A copy of the CDDL is also available via the Internet at
+ * http://www.illumos.org/license/CDDL.
+ */
+
+/*
+ * Copyright 2026 Oxide Computer Company
+ */
+
+/*
+ * See sys/rawmem.h for the design.  In short: a single vmem arena over
+ * PFN-space (quantum 1, so arena "addresses" are literally PFNs), built
+ * once from phys_rawmem and never resized.
+ */
+
+#include <sys/types.h>
+#include <sys/param.h>
+#include <sys/errno.h>
+#include <sys/sysmacros.h>
+#include <sys/vmem.h>
+#include <sys/memlist.h>
+#include <sys/machparam.h>
+#include <sys/bootconf.h>
+#include <sys/rawmem.h>
+#include <vm/page.h>
+
+static vmem_t *rawmem_arena;
+static pgcnt_t rawmem_total_pages;
+
+void
+rawmem_filter(uint64_t *addr, uint64_t *size)
+{
+	uint64_t span_end = *addr + *size;
+
+	for (;;) {
+		*size = span_end - *addr;
+		trim_kernel_range(addr, size);
+		if (*size == 0)
+			return;
+
+		pgcnt_t pages = *size >> MMU_PAGESHIFT;
+
+		/*
+		 * Skip rawmem_skip general-pool pages first; whatever remains
+		 * in this window (up to rawmem_resv) is reservation to emit.
+		 */
+		if (rawmem_skip > 0) {
+			pgcnt_t skip = MIN(rawmem_skip, pages);
+
+			rawmem_skip -= skip;
+			*addr += ptob(skip);
+			if (skip == pages) {
+				/*
+				 * This sub-window was fully skipped; loop to
+				 * find the next one before span_end.
+				 */
+				continue;
+			}
+			*size -= ptob(skip);
+			pages -= skip;
+		}
+
+		if (pages > rawmem_resv)
+			*size = ptob(rawmem_resv);
+		rawmem_resv -= *size >> MMU_PAGESHIFT;
+		return;
+	}
+}
+
+void
+rawmem_init(void)
+{
+	struct memlist *ml;
+
+	if (rawmem_pages == 0)
+		return;
+
+	rawmem_arena = vmem_create("rawmem", NULL, 0, 1,
+	    NULL, NULL, NULL, 0, VM_SLEEP);
+
+	for (ml = phys_rawmem; ml != NULL; ml = ml->ml_next) {
+		pgcnt_t pages = btop(ml->ml_size);
+
+		(void) vmem_add(rawmem_arena,
+		    (void *)(uintptr_t)btop(ml->ml_address), pages, VM_SLEEP);
+		rawmem_total_pages += pages;
+	}
+}
+
+int
+rawmem_alloc(pgcnt_t npages, uint_t align_pages, int vmflag, pfn_t *pfnp)
+{
+	void *res;
+
+	if (rawmem_arena == NULL)
+		return (ENXIO);
+
+	res = vmem_xalloc(rawmem_arena, npages, MAX(align_pages, 1), 0, 0,
+	    NULL, NULL, vmflag);
+	if (res == NULL)
+		return (ENOMEM);
+
+	*pfnp = (pfn_t)(uintptr_t)res;
+	return (0);
+}
+
+void
+rawmem_free(pfn_t pfn, pgcnt_t npages)
+{
+	vmem_xfree(rawmem_arena, (void *)(uintptr_t)pfn, npages);
+}
+
+void
+rawmem_query(pgcnt_t *totalp, pgcnt_t *freep)
+{
+	if (totalp != NULL)
+		*totalp = rawmem_arena != NULL ? rawmem_total_pages : 0;
+	if (freep != NULL)
+		*freep = rawmem_arena != NULL ?
+		    vmem_size(rawmem_arena, VMEM_FREE) : 0;
+}

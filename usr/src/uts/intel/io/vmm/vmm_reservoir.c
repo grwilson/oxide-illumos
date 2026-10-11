@@ -77,6 +77,42 @@
  * pages against `kvps[KV_VVP]` (the VMM kernel vnode) means they will be
  * properly tracked as KAS pages, but be excluded from normal dumps (unless the
  * operator has chosen to dump all of RAM).
+ *
+ *
+ * Large-Page Support
+ *
+ * The large page support only changes how the reservoir sources the physical
+ * memory that backs the pages it hands out -- every PFN returned to a
+ * consumer via vmmr_region_pfn_at() remains an ordinary PAGESIZE (4K) page.
+ * The benefit is purely on the host allocation side: filling the reservoir
+ * with page_create_va_large()-sourced, physically contiguous 2M chunks means
+ * far fewer, larger calls into the page allocator, and a better chance of
+ * getting genuinely contiguous memory before the system's free-page pool
+ * fragments.  It does not, by itself, give the guest any EPT/nPT large page
+ * TLB benefit, since the GPT still maps every page as an independent 4K leaf.
+ *
+ * The reservoir will allocate a whole large page as a unit, track its
+ * constituent PAGESIZE pages individually via a bitmap, and only return the
+ * whole large page to the system once every constituent has been individually
+ * released.
+ *
+ *
+ * Rawmem-Backed Pages
+ *
+ * If a rawmem reservation (see sys/rawmem.h) was configured at boot,
+ * the reservoir will try sourcing pages from it before falling back to
+ * page_create_va_large()/page_create_va().  Pages sourced this way have no
+ * page_t or vnode identity at all -- they were carved out of physical
+ * memory before page_t construction ran -- so they cannot be located via
+ * page_find().  Instead, each contiguous chunk obtained from
+ * rawmem_alloc() is tracked in vmmr_rawmem_tree, keyed by its
+ * reservoir-VA-relative offset: constituent PAGESIZE pages are released
+ * individually via a bitmap, and the chunk as a whole is only returned via
+ * rawmem_free() once every constituent has been released. Since rawmem's
+ * capacity is fixed for the life of the boot and may be much smaller
+ * than the reservoir's eventual size, this is purely an opportunistic first
+ * tier -- any portion of a request it cannot satisfy falls through to the
+ * ordinary paths unchanged.
  */
 
 #include <sys/types.h>
@@ -91,9 +127,13 @@
 #include <sys/systm.h>
 #include <sys/sunddi.h>
 #include <sys/policy.h>
+#include <sys/bitmap.h>
+#include <sys/sysmacros.h>
+#include <vm/page.h>
 #include <vm/seg_kmem.h>
 #include <vm/hat_i86.h>
 #include <sys/kstat.h>
+#include <sys/rawmem.h>
 
 #include <sys/vmm_reservoir.h>
 #include <sys/vmm_dev.h>
@@ -125,6 +165,74 @@ static uintptr_t vmmr_va;
 static uintptr_t vmmr_va_sz;
 
 static kstat_t *vmmr_kstat;
+
+/*
+ * Large-page sourcing state.
+ *
+ * vmmr_lpgsz is 0 if the platform exposes only a single page size (in which
+ * case none of the large-page logic below is ever exercised and the reservoir
+ * behaves exactly as it does upstream today).
+ */
+static uint_t	vmmr_lpg_szc;	/* page size code used for large allocations */
+static size_t	vmmr_lpgsz;	/* size, in bytes, of vmmr_lpg_szc (0 or 2M) */
+static pgcnt_t	vmmr_lpgcnt;	/* PAGESIZE pages contained in vmmr_lpgsz */
+
+/*
+ * Tracking structure for a single large-page-backed allocation.  `vl_base` is
+ * the reservoir-VA-relative offset (i.e. comparable to vmmr_span_t.vs_addr)
+ * of the first constituent page.  `vl_root` retains the page_t list handed
+ * back by page_create_va_large(), which is what must eventually be passed to
+ * page_free_pages().  `vl_freemap` has one bit per constituent PAGESIZE page,
+ * set as each is individually released via vmmr_release_from_group(); once
+ * `vl_nfree` reaches vmmr_lpgcnt, every constituent has been released and the
+ * group as a whole can be freed back to the system.
+ */
+typedef struct vmmr_lpg {
+	avl_node_t	vl_node;
+	uintptr_t	vl_base;
+	page_t		*vl_root;
+	pgcnt_t		vl_nfree;
+	ulong_t		*vl_freemap;
+} vmmr_lpg_t;
+
+/*
+ * Tracking structure for a single rawmem-sourced chunk used to back part
+ * of the reservoir. These pages have no page_t/vnode identity at all, so
+ * unlike the ordinary reservoir pages, they cannot be found via page_find();
+ * this side table is how vmmr_region_pfn_at() and vmmr_destroy_pages()
+ * locate them instead.
+ *
+ * vrc_base -  reservoir-VA-relative offset of the first constituent page
+ * vrc_pfn - base PFN returned by rawmem_alloc()
+ * vrc_pages - number of pages in a rawmem-sourced chunk
+ * vrc_freemap - bitmap of constituent pages which have been freed
+ * vrc_nfree - number of PAGESIZE pages that have been freed from this chunk
+ *
+ * Once vrc_nfree == vrc_pages, then the whole chunk is returned via
+ * rawmem_free().
+ */
+typedef struct vmmr_rawmem_chunk {
+	avl_node_t	vrc_node;
+	uintptr_t	vrc_base;
+	pfn_t		vrc_pfn;
+	pgcnt_t		vrc_pages;
+	pgcnt_t		vrc_nfree;
+	ulong_t		*vrc_freemap;
+} vmmr_rawmem_chunk_t;
+
+/*
+ * Protects vmmr_lpg_tree and vmmr_rawmem_tree only; never held across
+ * page_create/destroy or rawmem_alloc/free calls.
+ * XXX - if we remove large page support, then rename the lock.
+ */
+static kmutex_t vmmr_lpg_lock;
+static avl_tree_t vmmr_lpg_tree;
+static avl_tree_t vmmr_rawmem_tree;
+
+/*
+ * Set at vmmr_init() when the rawmem pool has nonzero capacity.
+ */
+static bool vmmr_rawmem_enabled;
 
 /* Pair of AVL trees to store set of spans ordered by addr and size */
 typedef struct vmmr_treepair {
@@ -162,11 +270,15 @@ typedef struct vmmr_kstats {
 	kstat_named_t	vmrks_bytes_alloc;
 	kstat_named_t	vmrks_bytes_transient;
 	kstat_named_t	vmrks_bytes_limit;
+	kstat_named_t	vmrks_rawmem_bytes_free;
+	kstat_named_t	vmrks_rawmem_bytes_alloc;
 } vmmr_kstats_t;
 
 
 static int vmmr_add(size_t, bool);
 static int vmmr_remove(size_t, bool);
+static vmmr_rawmem_chunk_t *vmmr_rawmem_find(uintptr_t);
+static int vmmr_resv_wait();
 
 static int
 vmmr_cmp_addr(const void *a, const void *b)
@@ -212,6 +324,36 @@ vmmr_cmp_region_addr(const void *a, const void *b)
 	if (sa->vs_region_addr == sb->vs_region_addr) {
 		return (0);
 	} else if (sa->vs_region_addr < sb->vs_region_addr) {
+		return (-1);
+	} else {
+		return (1);
+	}
+}
+
+static int
+vmmr_cmp_lpg_base(const void *a, const void *b)
+{
+	const vmmr_lpg_t *la = a;
+	const vmmr_lpg_t *lb = b;
+
+	if (la->vl_base == lb->vl_base) {
+		return (0);
+	} else if (la->vl_base < lb->vl_base) {
+		return (-1);
+	} else {
+		return (1);
+	}
+}
+
+static int
+vmmr_cmp_rawmem_base(const void *a, const void *b)
+{
+	const vmmr_rawmem_chunk_t *ca = a;
+	const vmmr_rawmem_chunk_t *cb = b;
+
+	if (ca->vrc_base == cb->vrc_base) {
+		return (0);
+	} else if (ca->vrc_base < cb->vrc_base) {
 		return (-1);
 	} else {
 		return (1);
@@ -354,6 +496,7 @@ static int
 vmmr_kstat_update(struct kstat *ksp, int rw)
 {
 	vmmr_kstats_t *vkp = ksp->ks_data;
+	pgcnt_t rawmem_total, rawmem_free;
 
 	mutex_enter(&vmmr_lock);
 	vkp->vmrks_bytes_free.value.ui64 = vmmr_free_sz;
@@ -368,6 +511,22 @@ vmmr_kstat_update(struct kstat *ksp, int rw)
 	vkp->vmrks_bytes_limit.value.ui64 = vmmr_total_limit;
 	mutex_exit(&vmmr_lock);
 
+	/*
+	 * XXX - maybe we need a kstat of how much of the reservoir is
+	 * page_t backed vs raw memory backed.
+	 */
+
+	/*
+	 * How much of the rawmem pool is free vs. already handed out.
+	 * Distinct from the fields above, which describe the reservoir
+	 * as a whole regardless of which underlying source backs a given
+	 * page.
+	 */
+	rawmem_query(&rawmem_total, &rawmem_free);
+	vkp->vmrks_rawmem_bytes_free.value.ui64 = rawmem_free << PAGESHIFT;
+	vkp->vmrks_rawmem_bytes_alloc.value.ui64 =
+	    (rawmem_total - rawmem_free) << PAGESHIFT;
+
 	return (0);
 }
 
@@ -375,6 +534,7 @@ int
 vmmr_init()
 {
 	mutex_init(&vmmr_lock, NULL, MUTEX_DEFAULT, NULL);
+	mutex_init(&vmmr_lpg_lock, NULL, MUTEX_DEFAULT, NULL);
 
 	/*
 	 * `vmm_total_limit` represents the absolute maximum size of the VMM
@@ -389,10 +549,18 @@ vmmr_init()
 	 *
 	 * The value is based off of pages_pp_maximum: "Number of currently
 	 * available pages that cannot be 'locked'".  It is sized as all of
-	 * `physmem` less 120% of `pages_pp_maximum`.
+	 * `physmem` less 120% of `pages_pp_maximum`, plus the full capacity
+	 * of the rawmem pool whose pages are carved out of `physmem` at
+	 * boot and so are not already reflected in it.
 	 */
+	pgcnt_t rawmem_pages;
+
+	rawmem_query(&rawmem_pages, NULL);
+	vmmr_rawmem_enabled = (rawmem_pages != 0);
+
 	vmmr_total_limit =
-	    (((physmem * 10)  - (pages_pp_maximum * 12)) * PAGESIZE) / 10;
+	    (((physmem * 10)  - (pages_pp_maximum * 12)) * PAGESIZE) / 10 +
+	    (rawmem_pages * PAGESIZE);
 
 	vmmr_empty_last = 0;
 	vmmr_free_sz = 0;
@@ -404,6 +572,22 @@ vmmr_init()
 	vmmr_target_sz = VMMR_TARGET_INACTIVE;
 
 	/*
+	 * Determine the large page size to target when filling the reservoir.
+	 * We use the smallest size larger than PAGESIZE that the platform
+	 * exposes (2M on i86pc).  If the platform only offers a single
+	 * page size, then large-page support is disabled.
+	 */
+	if (page_num_pagesizes() > 1) {
+		vmmr_lpg_szc = 1;
+		vmmr_lpgsz = page_get_pagesize(vmmr_lpg_szc);
+		vmmr_lpgcnt = vmmr_lpgsz >> PAGESHIFT;
+	} else {
+		vmmr_lpg_szc = 0;
+		vmmr_lpgsz = 0;
+		vmmr_lpgcnt = 0;
+	}
+
+	/*
 	 * Attempt kstat allocation early, since it is the only part of
 	 * reservoir initialization which is fallible.
 	 */
@@ -411,6 +595,7 @@ vmmr_init()
 	    VMM_KSTAT_CLASS, KSTAT_TYPE_NAMED,
 	    sizeof (vmmr_kstats_t) / sizeof (kstat_named_t), 0, GLOBAL_ZONEID);
 	if (ksp == NULL) {
+		mutex_destroy(&vmmr_lpg_lock);
 		mutex_destroy(&vmmr_lock);
 		return (ENOMEM);
 	}
@@ -425,19 +610,34 @@ vmmr_init()
 	    KSTAT_DATA_UINT64);
 	kstat_named_init(&vkp->vmrks_bytes_limit, "bytes_limit",
 	    KSTAT_DATA_UINT64);
+	kstat_named_init(&vkp->vmrks_rawmem_bytes_free, "rawmem_bytes_free",
+	    KSTAT_DATA_UINT64);
+	kstat_named_init(&vkp->vmrks_rawmem_bytes_alloc, "rawmem_bytes_alloc",
+	    KSTAT_DATA_UINT64);
 	ksp->ks_private = NULL;
 	ksp->ks_update = vmmr_kstat_update;
 	vmmr_kstat = ksp;
 
 	vmmr_tp_init(&vmmr_free_tp);
 	vmmr_tp_init(&vmmr_empty_tp);
+	avl_create(&vmmr_lpg_tree, vmmr_cmp_lpg_base, sizeof (vmmr_lpg_t),
+	    offsetof(vmmr_lpg_t, vl_node));
+	avl_create(&vmmr_rawmem_tree, vmmr_cmp_rawmem_base,
+	    sizeof (vmmr_rawmem_chunk_t), offsetof(vmmr_rawmem_chunk_t,
+	    vrc_node));
 
 	list_create(&vmmr_alloc_regions, sizeof (vmmr_region_t),
 	    offsetof(vmmr_region_t, vr_node));
 
-	/* Grab a chunk of VA for the reservoir */
-	vmmr_va_sz = physmem * PAGESIZE;
-	vmmr_va = (uintptr_t)vmem_alloc(kvmm_arena, vmmr_va_sz, VM_SLEEP);
+	/*
+	 * Grab a chunk of VA for the reservoir.  It is aligned to the large
+	 * page size when large page support is enabled.  Since rawmem pages
+	 * are additional capacity not already counted in `physmem`, the VA
+	 * range must be sized to cover both sources.
+	 */
+	vmmr_va_sz = (physmem + rawmem_pages) * PAGESIZE;
+	vmmr_va = (uintptr_t)vmem_xalloc(kvmm_arena, vmmr_va_sz,
+	    MAX(vmmr_lpgsz, PAGESIZE), 0, 0, NULL, NULL, VM_SLEEP);
 
 	kstat_install(vmmr_kstat);
 
@@ -457,6 +657,13 @@ vmmr_fini()
 	VERIFY(avl_is_empty(&vmmr_free_tp.by_size));
 	VERIFY(list_is_empty(&vmmr_alloc_regions));
 
+	mutex_enter(&vmmr_lpg_lock);
+	VERIFY(avl_is_empty(&vmmr_lpg_tree));
+	avl_destroy(&vmmr_lpg_tree);
+	VERIFY(avl_is_empty(&vmmr_rawmem_tree));
+	avl_destroy(&vmmr_rawmem_tree);
+	mutex_exit(&vmmr_lpg_lock);
+
 	kstat_delete(vmmr_kstat);
 	vmmr_kstat = NULL;
 
@@ -473,6 +680,7 @@ vmmr_fini()
 
 	mutex_exit(&vmmr_lock);
 	mutex_destroy(&vmmr_lock);
+	mutex_destroy(&vmmr_lpg_lock);
 }
 
 bool
@@ -571,6 +779,19 @@ vmmr_region_pfn_at(vmmr_region_t *region, uintptr_t off)
 		ASSERT3P(span, !=, NULL);
 	}
 	uintptr_t span_off = off - span->vs_region_addr + span->vs_addr;
+
+	if (vmmr_rawmem_enabled) {
+		mutex_enter(&vmmr_lpg_lock);
+		vmmr_rawmem_chunk_t *chunk = vmmr_rawmem_find(span_off);
+		if (chunk != NULL) {
+			pfn_t pfn = chunk->vrc_pfn +
+			    ((span_off - chunk->vrc_base) >> PAGESHIFT);
+			mutex_exit(&vmmr_lpg_lock);
+			return (pfn);
+		}
+		mutex_exit(&vmmr_lpg_lock);
+	}
+
 	page_t *pp = page_find(&kvps[KV_VVP], (u_offset_t)span_off);
 	VERIFY(pp != NULL);
 	return (pp->p_pagenum);
@@ -622,6 +843,98 @@ vmmr_free(vmmr_region_t *region)
 	mutex_exit(&vmmr_lock);
 }
 
+/*
+ * Release a single PAGESIZE page at the specified offset when it is
+ * a constituent of a tracked large-page group. Once all pages from a
+ * group have been freed, then return the group so that the large page
+ * can be freed.
+ *
+ * The caller is expected to have already hashed the page out (removing its
+ * vnode/offset identity) before calling this.
+ */
+static vmmr_lpg_t *
+vmmr_release_from_group(uintptr_t pos)
+{
+	vmmr_lpg_t search = { .vl_base = pos & ~(vmmr_lpgsz - 1) };
+	vmmr_lpg_t *group;
+	vmmr_lpg_t *done = NULL;
+
+	mutex_enter(&vmmr_lpg_lock);
+	group = avl_find(&vmmr_lpg_tree, &search, NULL);
+	if (group != NULL) {
+		const pgcnt_t idx = (pos - group->vl_base) >> PAGESHIFT;
+
+		VERIFY(!BT_TEST(group->vl_freemap, idx));
+		BT_SET(group->vl_freemap, idx);
+		group->vl_nfree++;
+
+		if (group->vl_nfree == vmmr_lpgcnt) {
+			avl_remove(&vmmr_lpg_tree, group);
+			done = group;
+		}
+	}
+	mutex_exit(&vmmr_lpg_lock);
+
+	return (done);
+}
+
+/*
+ * Find the rawmem chunk covering reservoir-VA-relative offset `pos`.
+ * Returns NULL when `pos` is backed by the ordinary page_t/vnode path
+ * instead.
+ */
+static vmmr_rawmem_chunk_t *
+vmmr_rawmem_find(uintptr_t pos)
+{
+	ASSERT(MUTEX_HELD(&vmmr_lpg_lock));
+
+	vmmr_rawmem_chunk_t search = { .vrc_base = pos };
+	vmmr_rawmem_chunk_t *chunk;
+	avl_index_t where;
+
+	chunk = avl_find(&vmmr_rawmem_tree, &search, &where);
+	if (chunk == NULL) {
+		chunk = avl_nearest(&vmmr_rawmem_tree, where, AVL_BEFORE);
+	}
+	if (chunk != NULL && (pos < chunk->vrc_base ||
+	    pos >= chunk->vrc_base + (chunk->vrc_pages << PAGESHIFT))) {
+		chunk = NULL;
+	}
+	return (chunk);
+}
+
+/*
+ * Release a single PAGESIZE page at the specified offset when it is a
+ * constituent of a tracked rawmem chunk. Returns false when `pos` isn't
+ * rawmem-tracked at all When true, `*done` will be non-NULL if the chunk
+ * is fully released.
+ */
+static bool
+vmmr_release_from_rawmem_chunk(uintptr_t pos, vmmr_rawmem_chunk_t **donep)
+{
+	vmmr_rawmem_chunk_t *chunk;
+
+	mutex_enter(&vmmr_lpg_lock);
+	chunk = vmmr_rawmem_find(pos);
+	if (chunk == NULL) {
+		mutex_exit(&vmmr_lpg_lock);
+		return (false);
+	}
+
+	const pgcnt_t idx = (pos - chunk->vrc_base) >> PAGESHIFT;
+
+	VERIFY(!BT_TEST(chunk->vrc_freemap, idx));
+	BT_SET(chunk->vrc_freemap, idx);
+	chunk->vrc_nfree++;
+
+	if (chunk->vrc_nfree == chunk->vrc_pages) {
+		avl_remove(&vmmr_rawmem_tree, chunk);
+		*donep = chunk;
+	}
+	mutex_exit(&vmmr_lpg_lock);
+	return (true);
+}
+
 static void
 vmmr_destroy_pages(vmmr_span_t *span)
 {
@@ -629,6 +942,18 @@ vmmr_destroy_pages(vmmr_span_t *span)
 	struct vnode *vp = &kvps[KV_VVP];
 	for (uintptr_t pos = span->vs_addr; pos < end; pos += PAGESIZE) {
 		page_t *pp;
+		vmmr_rawmem_chunk_t *chunk = NULL;
+
+		if (vmmr_rawmem_enabled &&
+		    vmmr_release_from_rawmem_chunk(pos, &chunk)) {
+			if (chunk != NULL) {
+				rawmem_free(chunk->vrc_pfn, chunk->vrc_pages);
+				kmem_free(chunk->vrc_freemap,
+				    BT_SIZEOFMAP(chunk->vrc_pages));
+				kmem_free(chunk, sizeof (*chunk));
+			}
+			continue;
+		}
 
 		/* Page-free logic cribbed from segkmem_xfree(): */
 		pp = page_find(vp, (u_offset_t)pos);
@@ -644,11 +969,127 @@ vmmr_destroy_pages(vmmr_span_t *span)
 
 		/*
 		 * Clear p_lckcnt so page_destroy() doesn't update availrmem.
-		 * That will be taken care of later via page_unresv().
+		 * That is taken care of explicitly below via page_unresv(),
+		 * matching the page_xresv() done when this page (or its
+		 * large-page group) was originally sourced in
+		 * vmmr_alloc_pages().
 		 */
 		pp->p_lckcnt = 0;
+
+		if (vmmr_lpgsz != 0 && pp->p_szc != 0) {
+			/*
+			 * This page is a constituent of a large-page group
+			 * sourced via vmmr_alloc_large().  Hash it out (as
+			 * page_destroy() would have) but do not individually
+			 * destroy it -- the group as a whole is only returned
+			 * to the system once every constituent has been
+			 * released.
+			 */
+			page_hashout(pp, NULL);
+
+			vmmr_lpg_t *group = vmmr_release_from_group(pos);
+			if (group != NULL) {
+				page_free_pages(group->vl_root);
+				kmem_free(group->vl_freemap,
+				    BT_SIZEOFMAP(vmmr_lpgcnt));
+				kmem_free(group, sizeof (*group));
+				page_unresv(vmmr_lpgcnt);
+			}
+			continue;
+		}
+
 		page_destroy(pp, 0);
+		page_unresv(1);
 	}
+}
+
+/*
+ * Attempt to source a single vmmr_lpgsz-sized, physically contiguous chunk of
+ * memory to back the reservoir VA range beginning at `pos`, and track it
+ * in vmmr_lpg_tree.  Upon failure, the caller will fall back to allocating
+ * the region with ordinary PAGESIZE allocations.
+ */
+static int
+vmmr_alloc_large(struct vnode *vp, struct seg *kseg, uintptr_t pos)
+{
+	ASSERT(vmmr_lpgsz != 0);
+	ASSERT0(P2PHASE(pos, vmmr_lpgsz));
+	ASSERT0(P2PHASE(vmmr_va + pos, vmmr_lpgsz));
+
+	page_t *first = page_create_va_large(vp, (u_offset_t)pos, vmmr_lpgsz,
+	    PG_EXCL | PG_NORELOC, kseg, (caddr_t)(vmmr_va + pos), NULL);
+	if (first == NULL) {
+		return (ENOMEM);
+	}
+
+	vmmr_lpg_t *group = kmem_zalloc(sizeof (vmmr_lpg_t), KM_SLEEP);
+	group->vl_base = pos;
+	group->vl_root = first;
+	group->vl_nfree = 0;
+	group->vl_freemap = kmem_zalloc(BT_SIZEOFMAP(vmmr_lpgcnt), KM_SLEEP);
+
+	page_t *list = first;
+	page_t *pp = list;
+	for (pgcnt_t i = 0; i < vmmr_lpgcnt; i++) {
+		/* mimic page state from segkmem, as the PAGESIZE path does */
+		ASSERT(PAGE_EXCL(pp));
+		page_io_unlock(pp);
+		pp->p_lckcnt = 1;
+
+		/* pre-zero the page */
+		bzero(hat_kpm_pfn2va(pp->p_pagenum), PAGESIZE);
+
+		page_t *next = pp->p_next;
+
+		/*
+		 * Unlink the page from the page_t's linked list so that
+		 * it can live independently in the reservoir.
+		 */
+		page_sub(&list, pp);
+		page_downgrade(pp);
+		pp = next;
+	}
+	ASSERT3P(list, ==, NULL);
+
+	mutex_enter(&vmmr_lpg_lock);
+	avl_add(&vmmr_lpg_tree, group);
+	mutex_exit(&vmmr_lpg_lock);
+
+	return (0);
+}
+
+/*
+ * Attempt to source `npages` PAGESIZE pages, aligned to `npages` pages, from
+ * the rawmem pool to back the reservoir VA range beginning at `pos`.  Upon
+ * failure (rawmem exhausted, or unconfigured), the caller falls back to
+ * the ordinary page_t-backed allocation paths.
+ */
+static int
+vmmr_alloc_rawmem_chunk(uintptr_t pos, pgcnt_t npages)
+{
+	pfn_t pfn;
+
+	if (rawmem_alloc(npages, npages, VM_NOSLEEP, &pfn) != 0) {
+		return (ENOMEM);
+	}
+
+	vmmr_rawmem_chunk_t *chunk =
+	    kmem_zalloc(sizeof (vmmr_rawmem_chunk_t), KM_SLEEP);
+	chunk->vrc_base = pos;
+	chunk->vrc_pfn = pfn;
+	chunk->vrc_pages = npages;
+	chunk->vrc_freemap = kmem_zalloc(BT_SIZEOFMAP(npages), KM_SLEEP);
+
+	for (pgcnt_t i = 0; i < npages; i++) {
+		/* pre-zero the page, matching the page_t-backed paths */
+		bzero(hat_kpm_pfn2va(pfn + i), PAGESIZE);
+	}
+
+	mutex_enter(&vmmr_lpg_lock);
+	avl_add(&vmmr_rawmem_tree, chunk);
+	mutex_exit(&vmmr_lpg_lock);
+
+	return (0);
 }
 
 static int
@@ -660,23 +1101,62 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 	struct vnode *vp = &kvps[KV_VVP];
 
 	const uintptr_t end = span->vs_addr + span->vs_size;
-	for (uintptr_t pos = span->vs_addr; pos < end; pos += PAGESIZE) {
+	uintptr_t pos = span->vs_addr;
+	int err;
+
+	while (pos < end) {
+		const uintptr_t remain = end - pos;
+		const bool lpg_aligned = vmmr_lpgsz != 0 &&
+		    remain >= vmmr_lpgsz &&
+		    P2PHASE(pos, vmmr_lpgsz) == 0 &&
+		    P2PHASE(vmmr_va + pos, vmmr_lpgsz) == 0;
+
+		if (lpg_aligned &&
+		    vmmr_alloc_rawmem_chunk(pos, vmmr_lpgcnt) == 0) {
+			pos += vmmr_lpgsz;
+			continue;
+		}
+
+		if (vmmr_alloc_rawmem_chunk(pos, 1) == 0) {
+			pos += PAGESIZE;
+			continue;
+		}
+
+		/*
+		 * Neither rawmem attempt succeeded, so this page must
+		 * come from the ordinary page_t-backed paths. Unlike
+		 * rawmem, those draw from the general system page pool,
+		 * so availrmem must be reserved via page_xresv() for exactly
+		 * the pages sourced this way, immediately before sourcing
+		 * them.
+		 */
+		if (lpg_aligned) {
+			if (page_xresv(vmmr_lpgcnt, KM_SLEEP,
+			    vmmr_resv_wait) == 0) {
+				err = EINTR;
+				goto fail;
+			}
+			if (vmmr_alloc_large(vp, &kseg, pos) == 0) {
+				pos += vmmr_lpgsz;
+				continue;
+			}
+			page_unresv(vmmr_lpgcnt);
+		}
+
+		if (page_xresv(1, KM_SLEEP, vmmr_resv_wait) == 0) {
+			err = EINTR;
+			goto fail;
+		}
+
 		page_t *pp;
 
 		pp = page_create_va(vp, (u_offset_t)pos, PAGESIZE,
 		    PG_EXCL | PG_NORELOC, &kseg, (void *)(vmmr_va + pos));
 
 		if (pp == NULL) {
-			/* Destroy any already-created pages */
-			if (pos != span->vs_addr) {
-				vmmr_span_t destroy_span = {
-					.vs_addr = span->vs_addr,
-					.vs_size = pos - span->vs_addr,
-				};
-
-				vmmr_destroy_pages(&destroy_span);
-			}
-			return (ENOMEM);
+			page_unresv(1);
+			err = ENOMEM;
+			goto fail;
 		}
 
 		/* mimic page state from segkmem */
@@ -687,9 +1167,23 @@ vmmr_alloc_pages(const vmmr_span_t *span)
 
 		/* pre-zero the page */
 		bzero(hat_kpm_pfn2va(pp->p_pagenum), PAGESIZE);
+
+		pos += PAGESIZE;
 	}
 
 	return (0);
+
+fail:
+	/* Destroy any already-created pages */
+	if (pos != span->vs_addr) {
+		vmmr_span_t destroy_span = {
+			.vs_addr = span->vs_addr,
+			.vs_size = pos - span->vs_addr,
+		};
+
+		vmmr_destroy_pages(&destroy_span);
+	}
+	return (err);
 }
 
 static int
@@ -758,16 +1252,7 @@ vmmr_add(size_t sz, bool transient)
 		return (ENOSPC);
 	}
 	vmmr_adding_sz += sz;
-	mutex_exit(&vmmr_lock);
 
-	/* Wait for enough pages to become available */
-	if (page_xresv(sz >> PAGESHIFT, KM_SLEEP, vmmr_resv_wait) == 0) {
-		mutex_enter(&vmmr_lock);
-		vmmr_adding_sz -= sz;
-		return (EINTR);
-	}
-
-	mutex_enter(&vmmr_lock);
 	size_t added = 0;
 	size_t remain = sz;
 	while (added < sz) {
@@ -813,7 +1298,6 @@ vmmr_add(size_t sz, bool transient)
 
 			vmmr_adding_sz -= sz;
 
-			page_unresv(sz >> PAGESHIFT);
 			return (err);
 		}
 
@@ -871,7 +1355,6 @@ vmmr_remove(size_t sz, bool transient)
 	} else {
 		vmmr_free_transient_sz -= sz;
 	}
-	page_unresv(sz >> PAGESHIFT);
 	return (0);
 }
 
@@ -974,6 +1457,29 @@ vmmr_ioctl(int cmd, intptr_t arg, int md, cred_t *cr, int *rvalp)
 		res.vrq_alloc_transient_sz = vmmr_alloc_transient_sz;
 		res.vrq_limit = vmmr_total_limit;
 		mutex_exit(&vmmr_lock);
+
+		if (ddi_copyout(&res, datap, sizeof (res), md) != 0) {
+			return (EFAULT);
+		}
+		break;
+	}
+	case VMM_RESV_QUERY2: {
+		struct vmm_resv_query2 res;
+		void *datap = (void *)(uintptr_t)arg;
+		pgcnt_t rawmem_total, rawmem_free;
+
+		/* For now, anyone with access to vmmctl device can query */
+		mutex_enter(&vmmr_lock);
+		res.vrq_free_sz = vmmr_free_sz;
+		res.vrq_alloc_sz = vmmr_alloc_sz;
+		res.vrq_alloc_transient_sz = vmmr_alloc_transient_sz;
+		res.vrq_limit = vmmr_total_limit;
+		mutex_exit(&vmmr_lock);
+
+		rawmem_query(&rawmem_total, &rawmem_free);
+		res.vrq_rawmem_total_sz = rawmem_total << PAGESHIFT;
+		res.vrq_rawmem_free_sz = rawmem_free << PAGESHIFT;
+
 		if (ddi_copyout(&res, datap, sizeof (res), md) != 0) {
 			return (EFAULT);
 		}

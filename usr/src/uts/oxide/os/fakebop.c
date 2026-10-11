@@ -66,12 +66,14 @@
 #include <sys/ctype.h>
 #include <vm/kboot_mmu.h>
 #include <vm/hat_pte.h>
+#include <vm/page.h>
 #include <sys/kobj.h>
 #include <sys/kobj_lex.h>
 #include <sys/pci_cfgspace_impl.h>
 #include <sys/ddipropdefs.h>	/* For DDI prop types */
 #include <sys/dw_apb_uart.h>
 #include <sys/uart.h>
+#include <sys/memlist_plat.h>
 #include <sys/apob.h>
 #include <sys/kapob.h>
 #include <sys/io/zen/ccx.h>
@@ -675,6 +677,7 @@ wait_for_psp(void)
  * greater knowledge and control of our environment, sufficiently so that one
  * day this might look more like the sun4 code than i86pc.
  */
+
 void
 _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 {
@@ -769,6 +772,99 @@ _start(uint64_t ramdisk_paddr, size_t ramdisk_len)
 	/*NOTREACHED*/
 }
 
+uint64_t rawmem_earmark_bytes = (44UL << 30); /* 44 GiB */
+uint_t rawmem_percent = 91;
+
+/*
+ * Matches omicron's RESERVOIR_SZ_ALIGN: the reservoir size is always
+ * rounded down to a 2 MiB boundary.
+ */
+#define	RAWMEM_RESERVOIR_SZ_ALIGN	(2ULL << 20)	/* 2 MiB */
+
+/*
+ * This is how the raw memory reservation is sized on oxide and
+ * mimics the behavior used by omicron to size the VMM reservoir:
+ *
+ *	rawmem_eligible = total_bytes
+ *		- (total_pages * sizeof (page_t))
+ *		- rawmem_earmark_bytes
+ *	rawmem_bytes = rawmem_eligible * rawmem_percent / 100
+ *
+ * total_pages here means physmem *after* the rawmem carve-out (i.e.
+ * btop(total_bytes) - rawmem_pages) -- exactly the quantity this
+ * function is solving for, so the above can't be evaluated by direct
+ * substitution. Let R be this function's result (rawmem_pages, in
+ * pages); equating R with rawmem_bytes/PAGESIZE turns the above into
+ * one linear equation in one unknown:
+ *
+ *	R * PAGESIZE = (rawmem_percent / 100)
+ *		* [total_bytes - sizeof (page_t) * (total_pages - R)
+ *		- rawmem_earmark_bytes]
+ *
+ * Solving for R:
+ *
+ *	R = [rawmem_percent * (total_bytes - rawmem_earmark_bytes)
+ *		- rawmem_percent * sizeof (page_t) * total_pages]
+ *		/ (100 * PAGESIZE - rawmem_percent * sizeof (page_t))
+ */
+static pgcnt_t
+oxide_rawmem_default_pages(uint64_t total_bytes)
+{
+	const uint64_t total_pages = btop(total_bytes);
+
+	if (total_bytes <= rawmem_earmark_bytes)
+		return (0);
+
+	uint64_t term1 = rawmem_percent * (total_bytes - rawmem_earmark_bytes);
+	uint64_t term2 = rawmem_percent * total_pages * sizeof (page_t);
+
+	if (term2 >= term1)
+		return (0);
+
+	uint64_t size_bytes = ptob((term1 - term2) /
+	    (100 * PAGESIZE - rawmem_percent * sizeof (page_t)));
+
+	/* size_bytes -= (size_bytes % RESERVOIR_SZ_ALIGN), per omicron. */
+	size_bytes -= size_bytes % RAWMEM_RESERVOIR_SZ_ALIGN;
+
+	cmn_err(CE_WARN, "raw memory reservation %llu bytes\n",
+	    (u_longlong_t)size_bytes);
+
+	return (btop(size_bytes));
+}
+
+/*
+ * Size and withhold the top rawmem_pages from eb_phys_alloc(), per the
+ * control-plane VMM-eligible-memory policy (oxide_rawmem_default_pages()
+ * above). This must be called after zen_apob_reserve_phys() has grown
+ * bootops->boot_mem->physinstalled to the real, discovered topology.
+ */
+void
+oxide_rawmem_init(void)
+{
+	pfn_t high_pfn;
+	pgcnt_t total;
+	struct memlist *physinstalled = bootops->boot_mem->physinstalled;
+
+	installed_top_size(physinstalled, &high_pfn, &total);
+
+	rawmem_pages = oxide_rawmem_default_pages(ptob(total));
+
+	if (rawmem_pages > 0) {
+		struct memlist *ml;
+		uint64_t top = 0;
+
+		for (ml = physinstalled; ml != NULL; ml = ml->ml_next) {
+			uint64_t end = ml->ml_address + ml->ml_size;
+			if (end > top)
+				top = end;
+		}
+
+		eb_physmem_reserve_range(top - ptob(rawmem_pages),
+		    ptob(rawmem_pages), EBPR_NO_ALLOC);
+	}
+}
+
 /* XXX shareable */
 /*ARGSUSED*/
 int
@@ -808,6 +904,126 @@ bootprop_getstr(const char *prop_name, char *buf, size_t buflen)
 	if (boot_prop_len < 0 || boot_prop_len >= buflen ||
 	    BOP_GETPROP(bootops, prop_name, buf) < 0)
 		return (-1);
+
+	return (0);
+}
+
+static int
+parse_value(const char *p, uint64_t *retval)
+{
+	uint64_t tmp = 0;
+	int digit;
+	int radix = 10;
+
+	if (*p == '0') {
+		++p;
+		if (*p == 0) {
+			*retval = 0;
+			return (0);
+		}
+		if (*p == 'x' || *p == 'X') {
+			radix = 16;
+			++p;
+		} else {
+			radix = 8;
+			++p;
+		}
+	}
+	while (*p) {
+		if ('0' <= *p && *p <= '9')
+			digit = *p - '0';
+		else if ('a' <= *p && *p <= 'f')
+			digit = 10 + *p - 'a';
+		else if ('A' <= *p && *p <= 'F')
+			digit = 10 + *p - 'A';
+		else
+			return (-1);
+		if (digit >= radix)
+			return (-1);
+		tmp = tmp * radix + digit;
+		++p;
+	}
+	*retval = tmp;
+	return (0);
+}
+
+/*
+ * Like bootprop_getval(), but the property value may carry an optional
+ * trailing k/K, m/M, g/G, or t/T suffix (base-1024) and then converting it
+ * to byte value, or a trailing '%' expressing it as an integer percentage of
+ * `total`.
+ */
+/* XXX shareable */
+int
+bootprop_getsize(const char *prop_name, uint64_t total, uint64_t *prop_value)
+{
+	int		boot_prop_len;
+	char		str[BP_MAX_STRLEN];
+	uint64_t	value;
+	uint64_t	scale = 1;
+	size_t		len;
+	boolean_t	is_pct = B_FALSE;
+
+	/*
+	 * Called before bootops (which BOP_GETPROPLEN()/BOP_GETPROP()
+	 * dereference) is set up, so use do_bsys_getproplen()/
+	 * do_bsys_getprop() directly, as the "physmem" handling does.
+	 */
+	boot_prop_len = do_bsys_getproplen(NULL, prop_name);
+	if (boot_prop_len < 0 || boot_prop_len >= sizeof (str) ||
+	    do_bsys_getprop(NULL, prop_name, str) < 0)
+		return (-1);
+
+	len = strlen(str);
+	if (len > 0) {
+		switch (str[len - 1]) {
+		case 'K':
+		case 'k':
+			scale = 1ULL << 10;
+			str[len - 1] = '\0';
+			break;
+		case 'M':
+		case 'm':
+			scale = 1ULL << 20;
+			str[len - 1] = '\0';
+			break;
+		case 'G':
+		case 'g':
+			scale = 1ULL << 30;
+			str[len - 1] = '\0';
+			break;
+		case 'T':
+		case 't':
+			scale = 1ULL << 40;
+			str[len - 1] = '\0';
+			break;
+		case '%':
+			is_pct = B_TRUE;
+			str[len - 1] = '\0';
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (parse_value(str, &value) == -1)
+		return (-1);
+
+	if (is_pct) {
+		if (value > 100)
+			return (-1);
+		if (value != 0 && (-1ULL / value) < total)
+			return (-1);
+		if (prop_value != NULL)
+			*prop_value = (total * value) / 100;
+		return (0);
+	}
+
+	if (value != 0 && (-1ULL / scale) < value)
+		return (-1);
+
+	if (prop_value != NULL)
+		*prop_value = value * scale;
 
 	return (0);
 }

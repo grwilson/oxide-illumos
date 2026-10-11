@@ -150,10 +150,10 @@ do_set_target(int fd, size_t sz, size_t chunk)
 static void
 do_query(int fd)
 {
-	struct vmm_resv_query data;
+	struct vmm_resv_query2 data;
 	int res;
 
-	res = ioctl(fd, VMM_RESV_QUERY, &data);
+	res = ioctl(fd, VMM_RESV_QUERY2, &data);
 	if (res != 0) {
 		perror("Could not query reservoir info");
 		return;
@@ -162,11 +162,15 @@ do_query(int fd)
 	printf("Free MiB:\t%zu\n"
 	    "Allocated MiB:\t%zu\n"
 	    "Transient Allocated MiB:\t%zu\n"
-	    "Size limit MiB:\t%zu\n",
+	    "Size limit MiB:\t%zu\n"
+	    "Rawmem total MiB:\t%zu\n"
+	    "Rawmem free MiB:\t%zu\n",
 	    data.vrq_free_sz / (1024 * 1024),
 	    data.vrq_alloc_sz / (1024 * 1024),
 	    data.vrq_alloc_transient_sz / (1024 * 1024),
-	    data.vrq_limit / (1024 * 1024));
+	    data.vrq_limit / (1024 * 1024),
+	    data.vrq_rawmem_total_sz / (1024 * 1024),
+	    data.vrq_rawmem_free_sz / (1024 * 1024));
 }
 
 int

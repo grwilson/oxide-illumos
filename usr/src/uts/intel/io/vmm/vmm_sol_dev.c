@@ -3144,6 +3144,7 @@ vmm_ctl_ioctl(int cmd, intptr_t arg, int md, cred_t *cr, int *rvalp)
 		}
 		return (0);
 	case VMM_RESV_QUERY:
+	case VMM_RESV_QUERY2:
 	case VMM_RESV_SET_TARGET:
 		return (vmmr_ioctl(cmd, arg, md, cr, rvalp));
 	default:

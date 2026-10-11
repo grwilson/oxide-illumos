@@ -54,6 +54,7 @@
 #include <sys/bootvfs.h>
 #include <sys/tsc.h>
 #include <sys/boot_data.h>
+#include <sys/boot_physmem.h>
 #include <sys/io/zen/apob.h>
 #include <sys/io/zen/ccx.h>
 #include <sys/io/zen/fabric.h>
@@ -290,6 +291,8 @@ mlsetup(struct regs *rp)
 		kmdb_enter();
 
 	zen_apob_reserve_phys();
+
+	oxide_rawmem_init();
 
 	cpu_vm_data_init(CPU);
 
